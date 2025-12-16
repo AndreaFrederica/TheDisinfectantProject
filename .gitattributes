@@ -1,2 +1,16 @@
 # SCM syntax highlighting & preventing 3-way merges
 pixi.lock merge=binary linguist-language=YAML linguist-generated=true
+
+# Exclude HTML directory and files from language statistics
+html/** linguist-generated
+
+!src/*.html
+
+# Exclude scraped data from statistics
+scraped_data/** linguist-generated
+
+# Exclude Chrome profile from statistics
+chrome_profile/** linguist-generated
+
+# Exclude debug files
+debug_*.html linguist-generated
