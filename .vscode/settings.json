@@ -1,6 +1,9 @@
 {
     "AndreaNovelHelper.workspaceDisabled": true,
     "cSpell.words": [
-        "pycache"
+        "beautifulsoup",
+        "lxml",
+        "pycache",
+        "pypi"
     ]
 }

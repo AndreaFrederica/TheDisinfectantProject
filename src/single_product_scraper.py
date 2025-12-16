@@ -2,6 +2,8 @@
 import json
 import time
 import os
+import sys
+from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -28,12 +30,18 @@ def scrape_single_product(driver, product_url):
     """
     Scrapes a single product page for all its style variations, including
     the name, image, and available sizes for each style.
+    Also scrapes product details like reviews and parameters.
     """
     print(f"Navigating to product page: {product_url}")
     driver.get(product_url)
 
     # Wait a bit for page to fully load
     time.sleep(3)
+
+    # Scroll down to load the detail section
+    print("Scrolling to load product details...")
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(2)
 
     all_styles_data = []
 
@@ -288,14 +296,324 @@ def scrape_single_product(driver, product_url):
         print(f"An unexpected error occurred: {e}")
         return None
 
-    return all_styles_data
+    # Prepare final result with both styles and product details
+    result = {
+        "styles": all_styles_data,
+        "product_details": scrape_product_details(driver)
+    }
+
+    return result
+
+def scrape_product_details(driver):
+    """Scrape product details including reviews, parameters and image details"""
+    details = {
+        "reviews": [],
+        "parameters": {},
+        "parameters_raw": "",  # Store raw DOM for parameters
+        "image_details": [],
+        "image_details_raw": ""  # Store raw DOM for image details
+    }
+
+    try:
+        # Find the detail info container
+        detail_container = driver.find_element(By.CSS_SELECTOR, '[class*="detailInfo"]')
+
+        # 1. Get Reviews
+        try:
+            # Find review comments
+            review_elements = detail_container.find_elements(By.CSS_SELECTOR, '[class*="Comment--"]')
+
+            for review_elem in review_elements[:5]:  # Limit to first 5 reviews
+                try:
+                    # Get user name
+                    user_name_elem = review_elem.find_element(By.CSS_SELECTOR, '[class*="userName--"]')
+                    user_name = user_name_elem.text.strip() if user_name_elem else "Anonymous"
+
+                    # Get date and purchase info
+                    meta_elem = review_elem.find_element(By.CSS_SELECTOR, '[class*="meta--"]')
+                    meta_info = meta_elem.text.strip() if meta_elem else ""
+
+                    # Get review content
+                    content_elem = review_elem.find_element(By.CSS_SELECTOR, '[class*="content--"]')
+                    content = content_elem.get_attribute('title') or content_elem.text.strip()
+
+                    # Get images if available
+                    images = []
+                    try:
+                        img_elements = review_elem.find_elements(By.CSS_SELECTOR, '[class*="photo--"] img')
+                        for img in img_elements:
+                            img_src = img.get_attribute('src')
+                            if img_src:
+                                images.append(img_src)
+                    except Exception:
+                        pass
+
+                    details["reviews"].append({
+                        "user": user_name,
+                        "meta": meta_info,
+                        "content": content,
+                        "images": images
+                    })
+                except Exception as e:
+                    print(f"  - Error extracting review: {str(e)}")
+                    continue
+        except Exception as e:
+            print(f"  - Error getting reviews: {str(e)}")
+
+        # 2. Get Product Parameters
+        params_area = None
+        try:
+            # Method 1: Look for paramsInfoArea class within detailInfo
+            param_elements = []
+
+            # First try to find paramsInfoArea directly in the page
+            try:
+                params_area = driver.find_element(By.CSS_SELECTOR, '[class*="paramsInfoArea"]')
+                print("  - Found paramsInfoArea directly in page")
+                # Save raw DOM for parameters
+                details["parameters_raw"] = params_area.get_attribute('outerHTML')
+            except:
+                # Try within detail_container
+                try:
+                    params_area = detail_container.find_element(By.CSS_SELECTOR, '[class*="paramsInfoArea"]')
+                    print("  - Found paramsInfoArea within detail_container")
+                    # Save raw DOM for parameters
+                    details["parameters_raw"] = params_area.get_attribute('outerHTML')
+                except:
+                    pass
+
+            if params_area:
+                # Get both emphasis and general params
+                emphasis_params = params_area.find_elements(By.CSS_SELECTOR, '[class*="emphasisParamsInfoItem--"]')
+                general_params = params_area.find_elements(By.CSS_SELECTOR, '[class*="generalParamsInfoItem--"]')
+                param_elements = emphasis_params + general_params
+                print(f"  - Found {len(emphasis_params)} emphasis params and {len(general_params)} general params")
+            else:
+                # Method 2: Look for data-tabindex elements containing "产品参数"
+                try:
+                    param_tabs = detail_container.find_elements(By.CSS_SELECTOR, '[data-tabindex]')
+                    for tab in param_tabs:
+                        try:
+                            tab_title = tab.find_element(By.CSS_SELECTOR, '[class*="tabTitle--"]')
+                            if tab_title and ("产品参数" in tab_title.text or "参数信息" in tab_title.text):
+                                param_elements = tab.find_elements(By.CSS_SELECTOR, '[class*="paramsInfoItem--"]')
+                                print(f"  - Found params via tab '{tab_title.text}': {len(param_elements)} items")
+                                # Save raw DOM for this tab
+                                details["parameters_raw"] = tab.get_attribute('outerHTML')
+                                break
+                        except:
+                            continue
+                except:
+                    pass
+
+            # If still no params, try direct search for parameter items
+            if not param_elements:
+                try:
+                    # Look for any element containing parameter info
+                    param_elements = driver.find_elements(By.CSS_SELECTOR, '[class*="emphasisParamsInfoItem--"], [class*="generalParamsInfoItem--"]')
+                    print(f"  - Found {len(param_elements)} params via direct search")
+                    # Save all found elements as raw DOM
+                    if param_elements:
+                        raw_html = ""
+                        for elem in param_elements:
+                            raw_html += elem.get_attribute('outerHTML') + "\n"
+                        details["parameters_raw"] = raw_html
+                except:
+                    pass
+
+            # Extract parameters with improved selectors
+            for param_elem in param_elements:
+                try:
+                    # Try multiple selector patterns for title and value
+                    title_elem = None
+                    subtitle_elem = None
+
+                    # Pattern 1: ItemTitle and ItemSubTitle
+                    try:
+                        title_elem = param_elem.find_element(By.CSS_SELECTOR, '[class*="ItemTitle--"]')
+                        subtitle_elem = param_elem.find_element(By.CSS_SELECTOR, '[class*="ItemSubTitle--"]')
+                    except:
+                        pass
+
+                    # Pattern 2: InfoItemTitle and InfoItemSubTitle
+                    if not title_elem or not subtitle_elem:
+                        try:
+                            title_elem = param_elem.find_element(By.CSS_SELECTOR, '[class*="InfoItemTitle--"]')
+                            subtitle_elem = param_elem.find_element(By.CSS_SELECTOR, '[class*="InfoItemSubTitle--"]')
+                        except:
+                            pass
+
+                    # Pattern 3: Direct child elements
+                    if not title_elem or not subtitle_elem:
+                        try:
+                            # Get all spans and assume first is title, second is value
+                            spans = param_elem.find_elements(By.TAG_NAME, 'span')
+                            if len(spans) >= 2:
+                                title_elem = spans[0]
+                                subtitle_elem = spans[1]
+                        except:
+                            pass
+
+                    if title_elem and subtitle_elem:
+                        param_name = title_elem.get_attribute('title') or title_elem.text.strip()
+                        param_value = subtitle_elem.get_attribute('title') or subtitle_elem.text.strip()
+                        if param_name and param_value:
+                            details["parameters"][param_name] = param_value
+                            print(f"    - Extracted: {param_name} = {param_value}")
+                except Exception as e:
+                    print(f"    - Error extracting parameter: {str(e)}")
+                    continue
+
+            print(f"  - Total parameters extracted: {len(details['parameters'])}")
+            print(f"  - Raw parameters DOM saved: {len(details['parameters_raw'])} characters")
+        except Exception as e:
+            print(f"  - Error getting parameters: {str(e)}")
+
+        # 3. Get Image Details from 图文详情 tab
+        try:
+            # Method 1: Try to find elements with data-tabindex attribute
+            image_tab = None
+
+            # First try to find tabs with data-tabindex
+            tabs = driver.find_elements(By.CSS_SELECTOR, '[data-tabindex]')
+
+            for tab in tabs:
+                try:
+                    # Look for tabDetailItemTitle class containing "图文详情"
+                    tab_title_elements = tab.find_elements(By.CSS_SELECTOR, '[class*="tabDetailItemTitle"]')
+                    for title_elem in tab_title_elements:
+                        if "图文详情" in title_elem.text:
+                            image_tab = tab
+                            print(f"  - Found 图文详情 tab (method 1)")
+                            break
+                    if image_tab:
+                        break
+                except Exception:
+                    continue
+
+            # Method 2: If not found, try searching the entire page
+            if not image_tab:
+                try:
+                    # Look for any element containing "图文详情" text
+                    elements_with_text = driver.find_elements(By.XPATH, "//*[contains(text(), '图文详情')]")
+                    for elem in elements_with_text:
+                        # Find the parent container with data-tabindex
+                        parent = elem
+                        for _ in range(5):  # Go up at most 5 levels
+                            try:
+                                parent = parent.find_element(By.XPATH, '..')
+                                if parent.get_attribute('data-tabindex'):
+                                    image_tab = parent
+                                    print(f"  - Found 图文详情 tab (method 2)")
+                                    break
+                            except:
+                                break
+                        if image_tab:
+                            break
+                except Exception as e:
+                    print(f"  - Method 2 failed: {str(e)}")
+
+            if image_tab:
+                try:
+                    # Save the entire tab's raw DOM first
+                    details["image_details_raw"] = image_tab.get_attribute('outerHTML')
+
+                    # Get the desc-root container within the tab
+                    desc_root = image_tab.find_element(By.CSS_SELECTOR, '[class*="desc-root"]')
+
+                    # Find all images - try multiple selectors
+                    img_selectors = [
+                        'img[class*="descV8-singleImage-image"]',
+                        '.descV8-singleImage-image',
+                        'img[class*="lazyload"]',
+                        'img[data-src]',
+                        'img[src*="alicdn.com"]'
+                    ]
+
+                    all_imgs = []
+                    for selector in img_selectors:
+                        try:
+                            img_elements = desc_root.find_elements(By.CSS_SELECTOR, selector)
+                            all_imgs.extend(img_elements)
+                            print(f"    - Selector '{selector}' found {len(img_elements)} images")
+                        except Exception:
+                            pass
+
+                    # Extract image URLs
+                    for img in all_imgs:
+                        # Try both src and data-src attributes
+                        img_src = img.get_attribute('data-src') or img.get_attribute('src')
+                        if img_src and img_src not in details["image_details"]:
+                            # Skip placeholder images
+                            if 'g.alicdn.com/s.gif' in img_src:
+                                # Check if this is a lazyloaded image
+                                img_src = img.get_attribute('data-src')
+                                if not img_src:
+                                    continue
+
+                            # Convert relative URLs to absolute
+                            if img_src.startswith('//'):
+                                img_src = 'https:' + img_src
+                            elif img_src.startswith('/'):
+                                img_src = 'https://img.alicdn.com' + img_src
+
+                            details["image_details"].append(img_src)
+                            print(f"    - Added image: {img_src[:80]}...")
+
+                    print(f"  - Found {len(details['image_details'])} images in 图文详情")
+                    print(f"  - Raw image details DOM saved: {len(details['image_details_raw'])} characters")
+                except Exception as e:
+                    print(f"  - Error extracting images from tab: {str(e)}")
+                    # Still save the tab DOM even if extraction fails
+                    try:
+                        details["image_details_raw"] = image_tab.get_attribute('outerHTML')
+                        print(f"  - Saved raw DOM despite extraction error")
+                    except:
+                        pass
+            else:
+                print("  - 图文详情 tab not found")
+                # Debug: try to save all tabs to see what's available
+                try:
+                    all_tabs = driver.find_elements(By.CSS_SELECTOR, '[data-tabindex]')
+                    print(f"  - Debug: Found {len(all_tabs)} tabs with data-tabindex")
+                    for i, tab in enumerate(all_tabs[:3]):  # Only check first 3
+                        try:
+                            title_text = tab.text[:50] if tab.text else "No text"
+                            print(f"    - Tab {i}: {title_text}")
+                        except:
+                            pass
+                except:
+                    pass
+        except Exception as e:
+            print(f"  - Error getting image details: {str(e)}")
+
+    except Exception as e:
+        print(f"Error scraping product details: {str(e)}")
+
+    return details
 
 def main():
     """Main execution function."""
-    # --- IMPORTANT ---
-    # The URL to be scraped should be provided here.
-    # This is the example URL the user wants to analyze.
-    product_url = "https://item.taobao.com/item.htm?id=853761881909&mi_id=0000CNMiLjV6zCXIf4sIAtDPnmJn0j3GxDUQGpTXwZioNwo&pvid=3ec3f4c5-2b45-47f8-adea-18098ff14f58&scm=1007.40986.467924.0&skuId=5820967066670&spm=a21bo.jianhua%2Fa.201876.d4.5af92a89ByDof5&utparam=%7B%22item_ctr%22%3A0.10585758090019226%2C%22x_object_type%22%3A%22item%22%2C%22matchType%22%3A%22nann_base%22%2C%22item_price%22%3A%22199%22%2C%22item_cvr%22%3A0.006797492504119873%2C%22umpCalled%22%3Atrue%2C%22pc_ctr%22%3A0.11560603976249695%2C%22pc_scene%22%3A%2220001%22%2C%22userId%22%3A2870588993%2C%22ab_info%22%3A%2230986%23467924%230_30986%23528214%2358507_30986%23527807%2358418_30986%23528109%2358485_30986%23521582%2357267_30986%23526064%2358189_30986%23528938%2357910_30986%23533296%2359487_30986%23530923%2359037_30986%23532805%2359017%22%2C%22tpp_buckets%22%3A%2230986%23467924%230_30986%23528214%2358507_30986%23527807%2358418_30986%23528109%2358485_30986%23521582%2357267_30986%23526064%2358189_30986%23528938%2357910_30986%23533296%2359487_30986%23530923%2359037_30986%23532805%2359017%22%2C%22aplus_abtest%22%3A%221f612159075e23338e1f22d6afa4cb23%22%2C%22isLogin%22%3Atrue%2C%22abid%22%3A%22528214_527807_528109_521582_526064_528938_533296_530923_532805%22%2C%22pc_pvid%22%3A%223ec3f4c5-2b45-47f8-adea-18098ff14f58%22%2C%22isWeekLogin%22%3Afalse%2C%22pc_alg_score%22%3A0.3136315665129%2C%22rn%22%3A3%2C%22item_ecpm%22%3A0%2C%22ump_price%22%3A%22199%22%2C%22isXClose%22%3Afalse%2C%22x_object_id%22%3A853761881909%7D&xxc=home_recommend" # Replace with the actual URL if needed
+    # Check if URL is provided as command line argument
+    if len(sys.argv) > 1:
+        product_url = sys.argv[1]
+        print(f"Using URL from command line: {product_url}")
+    else:
+        # Default URL if no command line argument is provided
+        # --- IMPORTANT ---
+        # The default URL to be scraped.
+        # This is the example URL the user wants to analyze.
+        product_url = "https://item.taobao.com/item.htm?id=853761881909&mi_id=0000CNMiLjV6zCXIf4sIAtDPnmJn0j3GxDUQGpTXwZioNwo&pvid=3ec3f4c5-2b45-47f8-adea-18098ff14f58&scm=1007.40986.467924.0&skuId=5820967066670&spm=a21bo.jianhua%2Fa.201876.d4.5af92a89ByDof5&utparam=%7B%22item_ctr%22%3A0.10585758090019226%2C%22x_object_type%22%3A%22item%22%2C%22matchType%22%3A%22nann_base%22%2C%22item_price%22%3A%22199%22%2C%22item_cvr%22%3A0.006797492504119873%2C%22umpCalled%22%3Atrue%2C%22pc_ctr%22%3A0.11560603976249695%2C%22pc_scene%22%3A%2220001%22%2C%22userId%22%3A2870588993%2C%22ab_info%22%3A%2230986%23467924%230_30986%23528214%2358507_30986%23527807%2358418_30986%23528109%2358485_30986%23521582%2357267_30986%23526064%2358189_30986%23528938%2357910_30986%23533296%2359487_30986%23530923%2359037_30986%23532805%2359017%22%2C%22tpp_buckets%22%3A%2230986%23467924%230_30986%23528214%2358507_30986%23527807%2358418_30986%23528109%2358485_30986%23521582%2357267_30986%23526064%2358189_30986%23528938%2357910_30986%23533296%2359487_30986%23530923%2359037_30986%23532805%2359017%22%2C%22aplus_abtest%22%3A%221f612159075e23338e1f22d6afa4cb23%22%2C%22isLogin%22%3Atrue%2C%22abid%22%3A%22528214_527807_528109_521582_526064_528938_533296_530923_532805%22%2C%22pc_pvid%22%3A%223ec3f4c5-2b45-47f8-adea-18098ff14f58%22%2C%22isWeekLogin%22%3Afalse%2C%22pc_alg_score%22%3A0.3136315665129%2C%22rn%22%3A3%2C%22item_ecpm%22%3A0%2C%22ump_price%22%3A%22199%22%2C%22isXClose%22%3Afalse%2C%22x_object_id%22%3A853761881909%7D&xxc=home_recommend"
+
+    # Create main output folder if it doesn't exist
+    main_output_folder = "scraped_data"
+    os.makedirs(main_output_folder, exist_ok=True)
+
+    # Create subfolder with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_folder = os.path.join(main_output_folder, f"scraped_data_{timestamp}")
+    os.makedirs(output_folder, exist_ok=True)
+    print(f"Output will be saved to folder: {output_folder}")
 
     driver = setup_driver()
 
@@ -311,28 +629,103 @@ def main():
             print("\n--- Scraping Complete ---")
 
             # Always save to a file with timestamp
-            filename = f"product_styles_{int(time.time())}.json"
+            filename = os.path.join(output_folder, "product_data.json")
             with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(product_info, f, indent=2, ensure_ascii=False)
             print(f"\nData saved to {filename}")
 
             # Also save a more readable version
-            readable_filename = f"product_styles_readable_{int(time.time())}.txt"
+            readable_filename = os.path.join(output_folder, "product_data_readable.txt")
             with open(readable_filename, 'w', encoding='utf-8') as f:
-                f.write("Product Style Information\n")
+                f.write("Product Information\n")
                 f.write("=" * 50 + "\n\n")
 
-                for idx, style in enumerate(product_info, 1):
+                # Write styles
+                f.write("STYLE VARIATIONS:\n")
+                f.write("-" * 30 + "\n")
+                for idx, style in enumerate(product_info.get('styles', []), 1):
                     f.write(f"Style {idx}: {style['style_name']}\n")
                     f.write(f"  Image URL: {style['image_url']}\n")
                     f.write(f"  Available Sizes: {', '.join(style['available_sizes']) if style['available_sizes'] else 'N/A'}\n")
-                    f.write("-" * 30 + "\n")
+                    f.write("\n")
+
+                # Write reviews
+                f.write("\nUSER REVIEWS:\n")
+                f.write("-" * 30 + "\n")
+                reviews = product_info.get('product_details', {}).get('reviews', [])
+                if reviews:
+                    for idx, review in enumerate(reviews[:5], 1):
+                        f.write(f"Review {idx}:\n")
+                        f.write(f"  User: {review['user']}\n")
+                        f.write(f"  Date/Purchase: {review['meta']}\n")
+                        f.write(f"  Content: {review['content'][:200]}...\n")
+                        if review.get('images'):
+                            f.write(f"  Images: {len(review['images'])} images\n")
+                        f.write("\n")
+                else:
+                    f.write("No reviews found.\n\n")
+
+                # Write parameters
+                f.write("PRODUCT PARAMETERS:\n")
+                f.write("-" * 30 + "\n")
+                params = product_info.get('product_details', {}).get('parameters', {})
+                if params:
+                    for key, value in params.items():
+                        f.write(f"{key}: {value}\n")
+                else:
+                    f.write("No parameters found.\n")
+
+                # Save raw HTML for parameters in separate file
+                params_raw = product_info.get('product_details', {}).get('parameters_raw', '')
+                if params_raw:
+                    params_html_filename = os.path.join(output_folder, "parameters_raw.html")
+                    with open(params_html_filename, 'w', encoding='utf-8') as params_file:
+                        params_file.write(params_raw)
+                    f.write(f"\n[Raw parameters HTML saved to: parameters_raw.html]\n")
+
+                # Save raw HTML for image details in separate file
+                f.write("\n\nIMAGE DETAILS:\n")
+                f.write("-" * 30 + "\n")
+                image_details = product_info.get('product_details', {}).get('image_details', [])
+                if image_details:
+                    f.write(f"Found {len(image_details)} images:\n")
+                    for idx, img_url in enumerate(image_details, 1):
+                        f.write(f"  {idx}. {img_url}\n")
+                else:
+                    f.write("No images found.\n")
+
+                # Save raw HTML for image details
+                img_details_raw = product_info.get('product_details', {}).get('image_details_raw', '')
+                if img_details_raw:
+                    img_html_filename = os.path.join(output_folder, "image_details_raw.html")
+                    with open(img_html_filename, 'w', encoding='utf-8') as img_file:
+                        img_file.write(img_details_raw)
+                    f.write(f"\n[Raw image details HTML saved to: image_details_raw.html]\n")
 
             print(f"Readable version saved to {readable_filename}")
 
-            # Also print the result to console
-            print("\nScraped Data:")
-            print(json.dumps(product_info, indent=2, ensure_ascii=False))
+            # Save debug HTML files if they exist
+            debug_files = ["debug_page_source.html", "debug_sku_container.html"]
+            for debug_file in debug_files:
+                if os.path.exists(debug_file):
+                    dest = os.path.join(output_folder, debug_file)
+                    os.rename(debug_file, dest)
+                    print(f"Debug file {debug_file} moved to {dest}")
+
+            # Print summary to console
+            print("\nScraping Summary:")
+            print(f"- Found {len(product_info.get('styles', []))} style variations")
+            print(f"- Found {len(product_info.get('product_details', {}).get('reviews', []))} reviews")
+            print(f"- Found {len(product_info.get('product_details', {}).get('parameters', {}))} parameters")
+
+            # Check if raw DOM data was saved
+            product_details = product_info.get('product_details', {})
+            if product_details.get('parameters_raw'):
+                print(f"- Raw parameters DOM: {len(product_details['parameters_raw'])} characters")
+            if product_details.get('image_details_raw'):
+                print(f"- Raw image details DOM: {len(product_details['image_details_raw'])} characters")
+
+            print(f"\nAll files saved in folder: {output_folder}")
 
         else:
             print("\n--- Scraping Failed ---")

@@ -5,3 +5,4 @@ novel-helper
 **.pyc
 __pycache__/
 chrome_profile/
+scraped_data/
