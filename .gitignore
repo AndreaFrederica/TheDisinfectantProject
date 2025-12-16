@@ -1,0 +1,7 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+novel-helper
+**.pyc
+__pycache__/
+chrome_profile/
