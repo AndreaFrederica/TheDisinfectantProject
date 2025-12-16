@@ -6,9 +6,8 @@ import os
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from detail_scraper import scrape_product_detail_page
 
 # --- Configuration and Setup ---
 
@@ -25,113 +24,98 @@ def load_shops_from_config(file_path="src/shops.json5"):
         return []
 
 def setup_driver():
-    """初始化并返回一个Chrome WebDriver实例"""
+    """初始化并返回一个Chrome WebDriver实例，并开启日志记录"""
     options = webdriver.ChromeOptions()
-    
-    # 使用绝对路径解决Windows下的读写警告问题
     profile_path = os.path.abspath('chrome_profile')
     options.add_argument(f'user-data-dir={profile_path}')
-    
     options.add_argument("--start-maximized")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument('--ignore-certificate-errors')
+    
+    # 开启浏览器日志记录
+    options.set_capability('goog:loggingPrefs', {'browser': 'ALL'})
+    
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
     return driver
 
 # --- Scraping Core Functions ---
 
-def scrape_all_product_details(driver, shop_url):
-    """访问店铺页面，滚动加载所有商品，并提取基本信息"""
+def get_all_product_links_via_click_intercept(driver, shop_url):
+    """
+    通过注入JS拦截window.open并模拟点击的方式，获取所有商品链接
+    """
     print(f"访问店铺页面: {shop_url}")
     driver.get(shop_url)
     time.sleep(3)
 
-    print("开始向下滚动以加载所有商品...")
+    # 注入JS拦截脚本
+    js_interceptor = """
+    (function () {
+      window._captured_urls = window._captured_urls || [];
+      const _open = window.open;
+      window.open = function (url, ...rest) {
+        console.log('[拦截并抓取]', url);
+        window._captured_urls.push(url);
+        return null; // 阻止打开新窗口
+      };
+      console.log('已安装链接拦截器');
+    })();
+    """
+    driver.execute_script(js_interceptor)
+    print("已成功向页面注入JS链接拦截器。")
+
+    print("开始向下滚动并模拟点击...")
     last_height = driver.execute_script("return document.body.scrollHeight")
     while True:
+        # 找到所有可见的商品卡片并点击
+        # 注意：这里我们只找 "title--" 部分，因为这是用户确认可点击的
+        item_elements = driver.find_elements(By.CSS_SELECTOR, 'div[class*="title--"]')
+        for element in item_elements:
+            try:
+                # 滚动到元素使其可见，然后点击
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+                time.sleep(0.1)
+                element.click()
+                time.sleep(0.2) # 等待JS事件触发
+            except Exception as e:
+                # 忽略不可点击的元素
+                pass
+        
+        # 滚动一屏
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(2)
         new_height = driver.execute_script("return document.body.scrollHeight")
         if new_height == last_height:
             break
         last_height = new_height
-    print("商品加载完成。")
-
-    products = []
-    # 注意：这个选择器是根据新的店铺结构编写的，使用了通配符以适应动态类名
-    item_elements = driver.find_elements(By.CSS_SELECTOR, 'div[class*="cardContainer"]')
-
-    print(f"初步发现 {len(item_elements)} 个商品。开始提取详细信息...")
-
-    for item in item_elements:
-        try:
-            # 在新的结构中，整个卡片可能就是一个链接，我们尝试在内部寻找 <a> 标签
-            # 并不是所有 cardContainer 都是一个商品，有些是广告或其它，找不到就跳过
-            link_element = item.find_element(By.TAG_NAME, "a")
-            product_url = link_element.get_attribute('href')
-
-            title_element = item.find_element(By.CSS_SELECTOR, 'div[class*="title"]')
-            product_name = title_element.text.strip()
-            
-            price_element = item.find_element(By.CSS_SELECTOR, 'div[class*="price"]')
-            # 价格被加密，这里只抓取可见的文本
-            price = price_element.text.strip().replace('\n', ' ')
-
-            products.append({
-                "name": product_name,
-                "price": price,
-                "url": product_url,
-                "stock": "未知",
-                "image_url": "未知"
-            })
-        except Exception as e:
-            # print(f"提取某个商品时出错: {e}。可能是因为商品结构不同或不是有效商品项。")
-            continue
-            
-    return products
-
-def scrape_detail_page(driver, product_url):
-    """访问商品详情页，提取库存和主图链接"""
-    details = {"stock": "获取失败", "image_url": "获取失败"}
-    try:
-        driver.get(product_url)
         
-        # 1. 获取库存
-        try:
-            stock_element = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.ID, "J_EmStock"))
-            )
-            stock_text = stock_element.text
-            stock_match = re.search(r'\d+', stock_text)
-            if stock_match:
-                details["stock"] = stock_match.group(0)
-            else:
-                details["stock"] = stock_text
-        except Exception:
-             # 如果找不到 J_EmStock，尝试从页面文本中搜索“库存”
-            try:
-                page_text = driver.find_element(By.TAG_NAME, 'body').text
-                stock_match = re.search(r'库存(\d+)件', page_text)
-                if stock_match:
-                    details["stock"] = stock_match.group(1)
-            except Exception:
-                pass # 保持 "获取失败"
-        
-        # 2. 获取主图链接
-        try:
-            image_element = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.ID, "J_ImgBooth"))
-            )
-            details["image_url"] = image_element.get_attribute('src')
-        except Exception:
-            pass # 保持 "获取失败"
+    print("模拟点击和滚动完成。")
 
-    except Exception as e:
-        print(f"  访问详情页 {product_url} 出错: {e}")
+    # 从JS全局变量和控制台日志中收集链接
+    print("正在从浏览器日志中提取链接...")
     
-    return details
+    # 方案A: 从执行JS返回的全局变量获取 (更稳定)
+    captured_urls = driver.execute_script("return window._captured_urls;")
+    if not captured_urls:
+        captured_urls = [] # 如果全局变量没有，确保是个空列表
+        
+    # 方案B: 从浏览器日志获取 (作为备用和补充)
+    try:
+        logs = driver.get_log('browser')
+        for entry in logs:
+            if '[拦截并抓取]' in entry['message']:
+                match = re.search(r'\\[拦截并抓取\\]\\s*"(https?://[^\"]+)"', entry['message'])
+                if match:
+                    url = match.group(1).replace('\\u002F', '/')
+                    captured_urls.append(url)
+    except Exception:
+        print("警告：无法从浏览器日志获取链接，可能部分链接会丢失。")
 
+
+    unique_links = sorted(list(set(captured_urls)))
+    print(f"发现 {len(unique_links)} 个独立的商品链接。")
+    return unique_links
 
 # --- Data Saving ---
 
@@ -177,20 +161,20 @@ def main():
 
             print(f"\n--- 正在处理店铺: {shop_name} ---")
             
-            products = scrape_all_product_details(driver, shop_url)
-            if not products:
-                print(f"未能从店铺 {shop_name} 提取到任何商品。")
+            product_links = get_all_product_links_via_click_intercept(driver, shop_url)
+            if not product_links:
+                print(f"未能从店铺 {shop_name} 提取到任何商品链接。")
                 continue
 
-            print(f"开始为 {len(products)} 个商品获取库存和主图链接...")
-            for i, product in enumerate(products):
-                print(f"  ({i+1}/{len(products)}) 处理: {product['name'][:30]}...")
-                details = scrape_detail_page(driver, product['url'])
-                product['stock'] = details['stock']
-                product['image_url'] = details['image_url']
+            all_products_data = []
+            print(f"开始访问 {len(product_links)} 个商品详情页以提取完整信息...")
+            for i, link in enumerate(product_links):
+                print(f"  ({i+1}/{len(product_links)}) 正在处理: {link}")
+                product_data = scrape_product_detail_page(driver, link)
+                all_products_data.append(product_data)
                 time.sleep(1)
 
-            save_products_to_csv(shop_name, products)
+            save_products_to_csv(shop_name, all_products_data)
 
     finally:
         print("\n所有任务完成，关闭浏览器。")
