@@ -169,6 +169,11 @@ def scrape_single_product(driver, product_url):
         for index, style_element in enumerate(style_elements):
             style_data = {"style_name": "N/A", "image_url": "N/A", "available_sizes": []}
 
+            # Check style availability first (before clicking)
+            data_disabled = style_element.get_attribute('data-disabled') or 'false'
+            style_is_available = data_disabled == 'false'
+            style_data["available"] = style_is_available
+
             # 1. Get Style Name - based on the DOM structure we analyzed
             style_name = "N/A"
             try:
@@ -193,44 +198,48 @@ def scrape_single_product(driver, product_url):
                 # Still continue even if we can't find the name
                 style_data["style_name"] = f"Style_{index + 1}"
 
-            print(f"\nProcessing Style {index + 1}: {style_data['style_name']}")
+            print(f"\nProcessing Style {index + 1}: {style_data['style_name']} ({'有货' if style_is_available else '缺货'})")
 
-            # 2. Click the style to trigger updates
-            try:
-                # Get the current main image URL to detect changes later
-                initial_img_src = driver.find_element(By.ID, "mainPicImageEl").get_attribute('src')
-                driver.execute_script("arguments[0].click();", style_element)
-            except Exception as e:
-                print(f"  - Could not click on style '{style_data['style_name']}'. Error: {e}")
-                continue
+            # 2. Click the style to trigger updates (only if available)
+            initial_img_src = None
+            if style_is_available:
+                try:
+                    # Get the current main image URL to detect changes later
+                    initial_img_src = driver.find_element(By.ID, "mainPicImageEl").get_attribute('src')
+                    driver.execute_script("arguments[0].click();", style_element)
+                except Exception as e:
+                    print(f"  - Could not click on style '{style_data['style_name']}'. Error: {e}")
+                    # Continue even if click fails
+            else:
+                print("  - Style is sold out, skipping click")
 
-            # 3. Wait for the main image to update and get the new URL
-            try:
-                # Wait a moment for the image to load
-                time.sleep(0.5)
-                # Get the main image element - it has id="mainPicImageEl"
-                main_img = driver.find_element(By.ID, "mainPicImageEl")
-                current_img_src = main_img.get_attribute('src')
+            # 3. Wait for the main image to update and get the new URL (only if we clicked)
+            if style_is_available and initial_img_src:
+                try:
+                    # Wait a moment for the image to load
+                    time.sleep(0.5)
+                    # Get the main image element - it has id="mainPicImageEl"
+                    main_img = driver.find_element(By.ID, "mainPicImageEl")
+                    current_img_src = main_img.get_attribute('src')
 
-                if current_img_src != initial_img_src:
-                    style_data["image_url"] = current_img_src
-                    print("  - Image updated successfully.")
-                else:
-                    # If we already got the image from the thumbnail, use that
-                    if style_data.get("image_url") == "N/A":
+                    if current_img_src != initial_img_src:
                         style_data["image_url"] = current_img_src
-                    print("  - Using current image URL.")
-            except Exception as e:
-                print(f"  - Error getting main image: {e}")
-                # Use the initial image as fallback
-                if style_data.get("image_url") == "N/A":
-                    style_data["image_url"] = initial_img_src
+                        print("  - Image updated successfully.")
+                    else:
+                        # If we already got the image from the thumbnail, use that
+                        if style_data.get("image_url") == "N/A":
+                            style_data["image_url"] = current_img_src
+                        print("  - Using current image URL.")
+                except Exception as e:
+                    print(f"  - Error getting main image: {e}")
+                    # Use the initial image as fallback
+                    if style_data.get("image_url") == "N/A":
+                        style_data["image_url"] = initial_img_src
 
-
-            # 4. Get available sizes for the current style - read after selecting style
-            available_sizes = []
+            # 4. Get sizes for the current style with their availability
+            sizes = []
             try:
-                # After clicking a style, we need to find the size SKU section
+                # After clicking a style (or if it's sold out), we need to find the size SKU section
                 size_sku_item = None
                 sku_items = sku_container.find_elements(By.CSS_SELECTOR, '[class*="skuItem"]')
 
@@ -252,39 +261,49 @@ def scrape_single_product(driver, product_url):
                     size_elements = content_div.find_elements(By.CSS_SELECTOR, '[class*="valueItem"]')
                     print(f"  - Debug: Found {len(size_elements)} size elements")
 
-                    # Filter out disabled sizes
+                    # Get all sizes with their availability
                     for size_element in size_elements:
-                        # Check if the size is disabled using data-disabled attribute
-                        data_disabled = size_element.get_attribute('data-disabled')
-                        if data_disabled == 'true':
-                            continue
-
-                        # Also check class for disabled indicators
-                        class_attr = size_element.get_attribute('class') or ''
-                        if 'disabled' in class_attr.lower():
-                            continue
-
-                        # Get the size name from the valueItemText span
+                        # Get size name
                         try:
                             size_name_tag = size_element.find_element(By.CSS_SELECTOR, 'span[class*="valueItemText"]')
                             size_name = size_name_tag.get_attribute('title') or size_name_tag.text.strip()
-                            if size_name and size_name not in available_sizes:
-                                available_sizes.append(size_name)
-                                print(f"    - Added size: {size_name}")
-                        except Exception as e:
+                        except Exception:
                             # Fallback to direct text
                             size_name = size_element.text.strip()
-                            if size_name and size_name not in available_sizes:
-                                available_sizes.append(size_name)
-                                print(f"    - Added size (fallback): {size_name}")
 
-                    style_data["available_sizes"] = available_sizes
-                    print(f"  - Found sizes: {available_sizes}")
+                        if not size_name:
+                            continue
+
+                        # Check size availability
+                        size_data_disabled = size_element.get_attribute('data-disabled') or 'false'
+                        # Convert string to boolean for easier comparison
+                        size_is_available = size_data_disabled == 'false'
+
+                        # Avoid duplicates - if size already exists, only add if not already in list
+                        existing_size = next((s for s in sizes if s['name'] == size_name), None)
+                        if not existing_size:
+                            sizes.append({
+                                "name": size_name,
+                                "available": size_is_available
+                            })
+                            print(f"    - Size {size_name}: {'有货' if size_is_available else '缺货'}")
+                        else:
+                            # Debug: print if we found a duplicate
+                            print(f"    - Debug: found duplicate size {size_name}, current: {existing_size['available']}, new: {size_is_available}")
+
+                    style_data["sizes"] = sizes
+                    available_size_names = [s['name'] for s in sizes if s['available']]
+                    print(f"  - Available sizes: {available_size_names}")
                 else:
                     print("  - Could not find size SKU section")
 
             except Exception as e:
                 print(f"  - Error getting sizes: {e}")
+                style_data["sizes"] = []
+
+            # Remove the old available_sizes field if it exists
+            if "available_sizes" in style_data:
+                del style_data["available_sizes"]
 
             all_styles_data.append(style_data)
             time.sleep(0.5) # Small delay between clicks
@@ -730,8 +749,18 @@ def main():
                 f.write("-" * 30 + "\n")
                 for idx, style in enumerate(product_info.get('styles', []), 1):
                     f.write(f"Style {idx}: {style['style_name']}\n")
+                    f.write(f"  Status: {'有货' if style.get('available', True) else '缺货'}\n")
                     f.write(f"  Image URL: {style['image_url']}\n")
-                    f.write(f"  Available Sizes: {', '.join(style['available_sizes']) if style['available_sizes'] else 'N/A'}\n")
+
+                    # Write sizes with availability
+                    sizes = style.get('sizes', [])
+                    if sizes:
+                        f.write("  Sizes:\n")
+                        for size in sizes:
+                            status = '有货' if size['available'] else '缺货'
+                            f.write(f"    - {size['name']} ({status})\n")
+                    else:
+                        f.write("  Sizes: N/A\n")
                     f.write("\n")
 
                 # Get product details from correct structure
