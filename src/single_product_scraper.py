@@ -296,8 +296,78 @@ def scrape_single_product(driver, product_url):
         print(f"An unexpected error occurred: {e}")
         return None
 
-    # Prepare final result with both styles and product details
+    # Extract product title and shop info
+    product_title = ""
+    shop_info = {}
+
+    try:
+        # Extract product title
+        title_element = driver.find_element(By.CSS_SELECTOR, '[class*="mainTitle--"]')
+        product_title = title_element.get_attribute('title') or title_element.text.strip()
+        print(f"Product title: {product_title}")
+    except Exception as e:
+        print(f"Error extracting product title: {e}")
+        # Fallback: try to get title from page title
+        try:
+            product_title = driver.title.split(' - ')[0]
+        except:
+            product_title = "Unknown Product"
+
+    try:
+        # Extract shop information
+        shop_header = driver.find_element(By.CSS_SELECTOR, '[class*="shopHeader--"]')
+
+        # Shop name
+        try:
+            shop_name_elem = shop_header.find_element(By.CSS_SELECTOR, '[class*="shopName--"]')
+            shop_info['name'] = shop_name_elem.get_attribute('title') or shop_name_elem.text.strip()
+        except:
+            shop_info['name'] = "Unknown Shop"
+
+        # Shop URL
+        try:
+            shop_link = shop_header.find_element(By.CSS_SELECTOR, 'a[href*="shop"]')
+            shop_url = shop_link.get_attribute('href')
+            if shop_url and shop_url.startswith('//'):
+                shop_url = 'https:' + shop_url
+            shop_info['url'] = shop_url
+        except:
+            shop_info['url'] = ""
+
+        # Shop rating
+        try:
+            rating_elem = shop_header.find_element(By.CSS_SELECTOR, '[class*="starNum--"]')
+            shop_info['rating'] = rating_elem.text.strip()
+        except:
+            shop_info['rating'] = ""
+
+        # Good review rate
+        try:
+            review_rate_elems = shop_header.find_elements(By.XPATH, ".//*[contains(text(), '好评率')]")
+            for elem in review_rate_elems:
+                if '好评率' in elem.text:
+                    shop_info['good_review_rate'] = elem.text.strip()
+                    break
+        except:
+            shop_info['good_review_rate'] = ""
+
+        print(f"Shop info: {shop_info}")
+    except Exception as e:
+        print(f"Error extracting shop info: {e}")
+        shop_info = {
+            'name': "Unknown Shop",
+            'url': "",
+            'rating': "",
+            'good_review_rate': ""
+        }
+
+    # Prepare final result with all data
     result = {
+        "product_info": {
+            "title": product_title,
+            "url": product_url,
+            "shop": shop_info
+        },
         "styles": all_styles_data,
         "product_details": scrape_product_details(driver)
     }
@@ -640,6 +710,21 @@ def main():
                 f.write("Product Information\n")
                 f.write("=" * 50 + "\n\n")
 
+                # Write product basic info
+                f.write("PRODUCT BASIC INFO:\n")
+                f.write("-" * 30 + "\n")
+                product_basic_info = product_info.get('product_info', {})
+                f.write(f"Title: {product_basic_info.get('title', 'N/A')}\n")
+                f.write(f"URL: {product_basic_info.get('url', 'N/A')}\n")
+
+                shop_info = product_basic_info.get('shop', {})
+                f.write(f"\nShop Information:\n")
+                f.write(f"  Name: {shop_info.get('name', 'N/A')}\n")
+                f.write(f"  URL: {shop_info.get('url', 'N/A')}\n")
+                f.write(f"  Rating: {shop_info.get('rating', 'N/A')}\n")
+                f.write(f"  Good Review Rate: {shop_info.get('good_review_rate', 'N/A')}\n")
+                f.write("\n")
+
                 # Write styles
                 f.write("STYLE VARIATIONS:\n")
                 f.write("-" * 30 + "\n")
@@ -649,10 +734,13 @@ def main():
                     f.write(f"  Available Sizes: {', '.join(style['available_sizes']) if style['available_sizes'] else 'N/A'}\n")
                     f.write("\n")
 
+                # Get product details from correct structure
+                product_details = product_info.get('product_details', {})
+
                 # Write reviews
                 f.write("\nUSER REVIEWS:\n")
                 f.write("-" * 30 + "\n")
-                reviews = product_info.get('product_details', {}).get('reviews', [])
+                reviews = product_details.get('reviews', [])
                 if reviews:
                     for idx, review in enumerate(reviews[:5], 1):
                         f.write(f"Review {idx}:\n")
@@ -668,7 +756,7 @@ def main():
                 # Write parameters
                 f.write("PRODUCT PARAMETERS:\n")
                 f.write("-" * 30 + "\n")
-                params = product_info.get('product_details', {}).get('parameters', {})
+                params = product_details.get('parameters', {})
                 if params:
                     for key, value in params.items():
                         f.write(f"{key}: {value}\n")
@@ -676,7 +764,7 @@ def main():
                     f.write("No parameters found.\n")
 
                 # Save raw HTML for parameters in separate file
-                params_raw = product_info.get('product_details', {}).get('parameters_raw', '')
+                params_raw = product_details.get('parameters_raw', '')
                 if params_raw:
                     params_html_filename = os.path.join(output_folder, "parameters_raw.html")
                     with open(params_html_filename, 'w', encoding='utf-8') as params_file:
@@ -686,7 +774,7 @@ def main():
                 # Save raw HTML for image details in separate file
                 f.write("\n\nIMAGE DETAILS:\n")
                 f.write("-" * 30 + "\n")
-                image_details = product_info.get('product_details', {}).get('image_details', [])
+                image_details = product_details.get('image_details', [])
                 if image_details:
                     f.write(f"Found {len(image_details)} images:\n")
                     for idx, img_url in enumerate(image_details, 1):
@@ -695,7 +783,7 @@ def main():
                     f.write("No images found.\n")
 
                 # Save raw HTML for image details
-                img_details_raw = product_info.get('product_details', {}).get('image_details_raw', '')
+                img_details_raw = product_details.get('image_details_raw', '')
                 if img_details_raw:
                     img_html_filename = os.path.join(output_folder, "image_details_raw.html")
                     with open(img_html_filename, 'w', encoding='utf-8') as img_file:
