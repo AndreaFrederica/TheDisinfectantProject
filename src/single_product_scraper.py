@@ -5,6 +5,8 @@ import time
 import os
 import sys
 from datetime import datetime
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, asdict
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -12,6 +14,94 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
+
+
+@dataclass
+class SizeInfo:
+    """Size information with availability"""
+    name: str
+    available: bool
+
+
+@dataclass
+class StyleInfo:
+    """Style variation information"""
+    style_name: str
+    image_url: str
+    available: bool
+    sizes: List[SizeInfo]
+
+
+@dataclass
+class ShopInfo:
+    """Shop information"""
+    name: str
+    url: str
+    rating: str
+    good_review_rate: Optional[str] = None
+
+
+@dataclass
+class ShippingInfo:
+    """Shipping information"""
+    delivery: Optional[str] = None
+    freight: Optional[str] = None
+    delivery_address: Optional[str] = None
+    guarantees: Optional[List[str]] = None
+
+
+@dataclass
+class PriceInfo:
+    """Price information"""
+    coupon_price: Optional[str] = None
+    original_price: Optional[str] = None
+    sales: Optional[str] = None
+
+
+@dataclass
+class CouponInfo:
+    """Coupon information"""
+    title: Optional[str] = None
+    text: Optional[str] = None
+
+
+@dataclass
+class ReviewInfo:
+    """Review information"""
+    user: str
+    meta: str
+    content: str
+    images: List[str]
+
+
+@dataclass
+class ProductDetails:
+    """Product detailed information"""
+    reviews: List[ReviewInfo]
+    parameters: Dict[str, str]
+    parameters_raw: str
+    image_details: List[str]
+    image_details_raw: str
+
+
+@dataclass
+class ProductInfo:
+    """Basic product information"""
+    title: str
+    url: str
+    shop: ShopInfo
+    shipping: ShippingInfo
+    price: PriceInfo
+    coupons: List[CouponInfo]
+
+
+@dataclass
+class ProductData:
+    """Complete product data structure"""
+    product_info: ProductInfo
+    styles: List[StyleInfo]
+    product_details: ProductDetails
+
 
 def setup_driver():
     """Initializes and returns a Chrome WebDriver instance."""
@@ -861,6 +951,181 @@ def scrape_product_details(driver):
 
     return details
 
+
+def scrape_product_data(product_url: str, driver=None, save_to_file: bool = False,
+                        output_folder: Optional[str] = None,
+                        close_driver: bool = False) -> Optional[ProductData]:
+    """
+    Entry point for other modules to scrape product data.
+
+    Args:
+        product_url: The product URL to scrape
+        driver: Optional existing WebDriver instance. If None, creates a new one.
+        save_to_file: Whether to save the scraped data to files
+        output_folder: Optional output folder path. If None and save_to_file is True,
+                      creates a timestamped folder in scraped_data/
+        close_driver: Whether to close the driver after scraping. Only used when driver is provided.
+                     If driver is None (created internally), it will always be closed.
+
+    Returns:
+        ProductData object with all scraped information, or None if scraping failed
+    """
+    # Create driver if not provided
+    driver_created = False
+    if driver is None:
+        driver = setup_driver()
+        driver_created = True
+        # Login period
+        print("Opening Taobao/Tmall. Please log in manually if required within 5 seconds.")
+        driver.get("https://www.taobao.com")
+        time.sleep(5)
+        print("Login period over. Starting scrape...")
+
+    try:
+        # Scrape the product
+        result_dict = scrape_single_product(driver, product_url)
+
+        if not result_dict:
+            print(f"Failed to scrape product: {product_url}")
+            return None
+
+        # Convert dictionary to ProductData object
+        product_data = _dict_to_product_data(result_dict)
+
+        # Save to file if requested
+        if save_to_file:
+            _save_product_data_to_files(product_data, result_dict, output_folder)
+
+        return product_data
+
+    finally:
+        # Close driver only if we created it OR if close_driver is explicitly True
+        if driver_created or close_driver:
+            driver.quit()
+
+
+def _dict_to_product_data(data: Dict[str, Any]) -> ProductData:
+    """Convert dictionary data to ProductData object."""
+    # Convert product info
+    product_info_dict = data['product_info']
+
+    # Handle shop info with defaults for missing fields
+    shop_dict = product_info_dict['shop']
+    shop_info = ShopInfo(
+        name=shop_dict.get('name', 'Unknown Shop'),
+        url=shop_dict.get('url', ''),
+        rating=shop_dict.get('rating', ''),
+        good_review_rate=shop_dict.get('good_review_rate', '')
+    )
+
+    shipping_info = ShippingInfo(**product_info_dict.get('shipping', {}))
+    price_info = PriceInfo(**product_info_dict.get('price', {}))
+    coupons = [CouponInfo(**c) for c in product_info_dict.get('coupons', [])]
+
+    product_info = ProductInfo(
+        title=product_info_dict['title'],
+        url=product_info_dict['url'],
+        shop=shop_info,
+        shipping=shipping_info,
+        price=price_info,
+        coupons=coupons
+    )
+
+    # Convert styles
+    styles = []
+    for style_dict in data['styles']:
+        sizes = [SizeInfo(**size_dict) for size_dict in style_dict.get('sizes', [])]
+        style = StyleInfo(
+            style_name=style_dict['style_name'],
+            image_url=style_dict['image_url'],
+            available=style_dict.get('available', True),
+            sizes=sizes
+        )
+        styles.append(style)
+
+    # Convert product details
+    details_dict = data['product_details']
+    reviews = [ReviewInfo(**review) for review in details_dict.get('reviews', [])]
+    product_details = ProductDetails(
+        reviews=reviews,
+        parameters=details_dict.get('parameters', {}),
+        parameters_raw=details_dict.get('parameters_raw', ''),
+        image_details=details_dict.get('image_details', []),
+        image_details_raw=details_dict.get('image_details_raw', '')
+    )
+
+    return ProductData(
+        product_info=product_info,
+        styles=styles,
+        product_details=product_details
+    )
+
+
+def _save_product_data_to_files(product_data: ProductData, original_dict: Dict[str, Any],
+                               output_folder: Optional[str] = None):
+    """Save product data to files."""
+    if output_folder is None:
+        # Create timestamped folder
+        main_output_folder = "scraped_data"
+        os.makedirs(main_output_folder, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_folder = os.path.join(main_output_folder, f"scraped_data_{timestamp}")
+        os.makedirs(output_folder, exist_ok=True)
+
+    print(f"Saving data to folder: {output_folder}")
+
+    # Save as JSON (convert dataclass to dict)
+    json_data = asdict(product_data)
+    filename = os.path.join(output_folder, "product_data.json")
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(json_data, f, indent=2, ensure_ascii=False)
+    print(f"Data saved to {filename}")
+
+    # Save readable version
+    readable_filename = os.path.join(output_folder, "product_data_readable.txt")
+    with open(readable_filename, 'w', encoding='utf-8') as f:
+        f.write("Product Information\n")
+        f.write("=" * 50 + "\n\n")
+
+        # Product info
+        f.write(f"Title: {product_data.product_info.title}\n")
+        f.write(f"URL: {product_data.product_info.url}\n")
+
+        # Shop info
+        f.write("\nShop Information:\n")
+        f.write(f"  Name: {product_data.product_info.shop.name}\n")
+        f.write(f"  Rating: {product_data.product_info.shop.rating}\n")
+        f.write(f"  Good Review Rate: {product_data.product_info.shop.good_review_rate}\n")
+
+        # Styles
+        f.write("\nStyle Variations:\n")
+        for idx, style in enumerate(product_data.styles, 1):
+            f.write(f"\nStyle {idx}: {style.style_name}\n")
+            f.write(f"  Status: {'有货' if style.available else '缺货'}\n")
+            f.write(f"  Sizes: {', '.join([s.name for s in style.sizes])}\n")
+
+        # Reviews count
+        f.write(f"\nTotal Reviews: {len(product_data.product_details.reviews)}\n")
+        f.write(f"Total Parameters: {len(product_data.product_details.parameters)}\n")
+
+    print(f"Readable version saved to {readable_filename}")
+
+    # Save raw HTML files if they exist
+    params_raw = original_dict.get('product_details', {}).get('parameters_raw', '')
+    if params_raw:
+        params_filename = os.path.join(output_folder, "parameters_raw.html")
+        with open(params_filename, 'w', encoding='utf-8') as f:
+            f.write(params_raw)
+        print(f"Raw parameters HTML saved to {params_filename}")
+
+    img_raw = original_dict.get('product_details', {}).get('image_details_raw', '')
+    if img_raw:
+        img_filename = os.path.join(output_folder, "image_details_raw.html")
+        with open(img_filename, 'w', encoding='utf-8') as f:
+            f.write(img_raw)
+        print(f"Raw image details HTML saved to {img_filename}")
+
+
 def main():
     """Main execution function."""
     # Check if URL is provided as command line argument
@@ -884,187 +1149,29 @@ def main():
     os.makedirs(output_folder, exist_ok=True)
     print(f"Output will be saved to folder: {output_folder}")
 
-    driver = setup_driver()
+    # Use the new entry point function
+    product_data = scrape_product_data(
+        product_url=product_url,
+        save_to_file=True,
+        output_folder=output_folder
+    )
 
-    try:
-        print("Opening Taobao/Tmall. Please log in manually if required within 5 seconds.")
-        driver.get("https://www.taobao.com")
-        time.sleep(5)
-        print("Login period over. Starting scrape...")
+    if product_data:
+        print("\n--- Scraping Complete ---")
+        # Print summary to console
+        print("\nScraping Summary:")
+        print(f"- Found {len(product_data.styles)} style variations")
+        print(f"- Found {len(product_data.product_details.reviews)} reviews")
+        print(f"- Found {len(product_data.product_details.parameters)} parameters")
 
-        product_info = scrape_single_product(driver, product_url)
-
-        if product_info:
-            print("\n--- Scraping Complete ---")
-
-            # Always save to a file with timestamp
-            filename = os.path.join(output_folder, "product_data.json")
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(product_info, f, indent=2, ensure_ascii=False)
-            print(f"\nData saved to {filename}")
-
-            # Also save a more readable version
-            readable_filename = os.path.join(output_folder, "product_data_readable.txt")
-            with open(readable_filename, 'w', encoding='utf-8') as f:
-                f.write("Product Information\n")
-                f.write("=" * 50 + "\n\n")
-
-                # Write product basic info
-                f.write("PRODUCT BASIC INFO:\n")
-                f.write("-" * 30 + "\n")
-                product_basic_info = product_info.get('product_info', {})
-                f.write(f"Title: {product_basic_info.get('title', 'N/A')}\n")
-                f.write(f"URL: {product_basic_info.get('url', 'N/A')}\n")
-
-                # Write shop information
-                shop_info = product_basic_info.get('shop', {})
-                f.write("\nShop Information:\n")
-                f.write(f"  Name: {shop_info.get('name', 'N/A')}\n")
-                f.write(f"  URL: {shop_info.get('url', 'N/A')}\n")
-                f.write(f"  Rating: {shop_info.get('rating', 'N/A')}\n")
-                f.write(f"  Good Review Rate: {shop_info.get('good_review_rate', 'N/A')}\n")
-
-                # Write shipping information
-                shipping_info = product_basic_info.get('shipping', {})
-                if shipping_info:
-                    f.write("\nShipping Information:\n")
-                    if shipping_info.get('delivery'):
-                        f.write(f"  Delivery: {shipping_info['delivery']}\n")
-                    if shipping_info.get('freight'):
-                        f.write(f"  Freight: {shipping_info['freight']}\n")
-                    if shipping_info.get('delivery_address'):
-                        f.write(f"  Delivery Address: {shipping_info['delivery_address']}\n")
-                    if shipping_info.get('guarantees'):
-                        f.write(f"  Guarantees: {', '.join(shipping_info['guarantees'])}\n")
-
-                # Write price information
-                price_info = product_basic_info.get('price', {})
-                if price_info:
-                    f.write("\nPrice Information:\n")
-                    if price_info.get('coupon_price'):
-                        f.write(f"  券后: {price_info['coupon_price']}\n")
-                    if price_info.get('original_price'):
-                        f.write(f"  优惠前: {price_info['original_price']}\n")
-                    if price_info.get('sales'):
-                        f.write(f"  Sales: {price_info['sales']}\n")
-
-
-                # Write coupon information
-                coupons = product_basic_info.get('coupons', [])
-                if coupons:
-                    f.write("\nCoupons:\n")
-                    for i, coupon in enumerate(coupons, 1):
-                        f.write(f"  {i}. {coupon.get('text', 'N/A')}\n")
-
-                f.write("\n")
-
-                # Write styles
-                f.write("STYLE VARIATIONS:\n")
-                f.write("-" * 30 + "\n")
-                for idx, style in enumerate(product_info.get('styles', []), 1):
-                    f.write(f"Style {idx}: {style['style_name']}\n")
-                    f.write(f"  Status: {'有货' if style.get('available', True) else '缺货'}\n")
-                    f.write(f"  Image URL: {style['image_url']}\n")
-
-                    # Write sizes with availability
-                    sizes = style.get('sizes', [])
-                    if sizes:
-                        f.write("  Sizes:\n")
-                        for size in sizes:
-                            status = '有货' if size['available'] else '缺货'
-                            f.write(f"    - {size['name']} ({status})\n")
-                    else:
-                        f.write("  Sizes: N/A\n")
-                    f.write("\n")
-
-                # Get product details from correct structure
-                product_details = product_info.get('product_details', {})
-
-                # Write reviews
-                f.write("\nUSER REVIEWS:\n")
-                f.write("-" * 30 + "\n")
-                reviews = product_details.get('reviews', [])
-                if reviews:
-                    for idx, review in enumerate(reviews[:5], 1):
-                        f.write(f"Review {idx}:\n")
-                        f.write(f"  User: {review['user']}\n")
-                        f.write(f"  Date/Purchase: {review['meta']}\n")
-                        f.write(f"  Content: {review['content'][:200]}...\n")
-                        if review.get('images'):
-                            f.write(f"  Images: {len(review['images'])} images\n")
-                        f.write("\n")
-                else:
-                    f.write("No reviews found.\n\n")
-
-                # Write parameters
-                f.write("PRODUCT PARAMETERS:\n")
-                f.write("-" * 30 + "\n")
-                params = product_details.get('parameters', {})
-                if params:
-                    for key, value in params.items():
-                        f.write(f"{key}: {value}\n")
-                else:
-                    f.write("No parameters found.\n")
-
-                # Save raw HTML for parameters in separate file
-                params_raw = product_details.get('parameters_raw', '')
-                if params_raw:
-                    params_html_filename = os.path.join(output_folder, "parameters_raw.html")
-                    with open(params_html_filename, 'w', encoding='utf-8') as params_file:
-                        params_file.write(params_raw)
-                    f.write(f"\n[Raw parameters HTML saved to: parameters_raw.html]\n")
-
-                # Save raw HTML for image details in separate file
-                f.write("\n\nIMAGE DETAILS:\n")
-                f.write("-" * 30 + "\n")
-                image_details = product_details.get('image_details', [])
-                if image_details:
-                    f.write(f"Found {len(image_details)} images:\n")
-                    for idx, img_url in enumerate(image_details, 1):
-                        f.write(f"  {idx}. {img_url}\n")
-                else:
-                    f.write("No images found.\n")
-
-                # Save raw HTML for image details
-                img_details_raw = product_details.get('image_details_raw', '')
-                if img_details_raw:
-                    img_html_filename = os.path.join(output_folder, "image_details_raw.html")
-                    with open(img_html_filename, 'w', encoding='utf-8') as img_file:
-                        img_file.write(img_details_raw)
-                    f.write(f"\n[Raw image details HTML saved to: image_details_raw.html]\n")
-
-            print(f"Readable version saved to {readable_filename}")
-
-            # Save debug HTML files if they exist
-            debug_files = ["debug_page_source.html", "debug_sku_container.html"]
-            for debug_file in debug_files:
-                if os.path.exists(debug_file):
-                    dest = os.path.join(output_folder, debug_file)
-                    os.rename(debug_file, dest)
-                    print(f"Debug file {debug_file} moved to {dest}")
-
-            # Print summary to console
-            print("\nScraping Summary:")
-            print(f"- Found {len(product_info.get('styles', []))} style variations")
-            print(f"- Found {len(product_info.get('product_details', {}).get('reviews', []))} reviews")
-            print(f"- Found {len(product_info.get('product_details', {}).get('parameters', {}))} parameters")
-
-            # Check if raw DOM data was saved
-            product_details = product_info.get('product_details', {})
-            if product_details.get('parameters_raw'):
-                print(f"- Raw parameters DOM: {len(product_details['parameters_raw'])} characters")
-            if product_details.get('image_details_raw'):
-                print(f"- Raw image details DOM: {len(product_details['image_details_raw'])} characters")
-
-            print(f"\nAll files saved in folder: {output_folder}")
-
-        else:
-            print("\n--- Scraping Failed ---")
-            print("Could not retrieve product style information.")
-
-    finally:
-        print("\nClosing browser.")
-        driver.quit()
+        # Check if raw DOM data was saved
+        if product_data.product_details.parameters_raw:
+            print(f"- Raw parameters DOM: {len(product_data.product_details.parameters_raw)} characters")
+        if product_data.product_details.image_details_raw:
+            print(f"- Raw image details DOM: {len(product_data.product_details.image_details_raw)} characters")
+    else:
+        print("\n--- Scraping Failed ---")
+        print("Could not retrieve product style information.")
 
 if __name__ == "__main__":
     main()
