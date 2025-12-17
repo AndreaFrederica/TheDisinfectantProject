@@ -786,6 +786,8 @@ def scrape_product_details(driver):
                     # Try multiple selector patterns for title and value
                     title_elem = None
                     subtitle_elem = None
+                    class_attr = param_elem.get_attribute('class') or ''
+                    is_emphasis = 'emphasisParamsInfoItem' in class_attr  # Emphasis block shows value first, label second
 
                     # Pattern 1: ItemTitle and ItemSubTitle
                     try:
@@ -814,8 +816,19 @@ def scrape_product_details(driver):
                             pass
 
                     if title_elem and subtitle_elem:
-                        param_name = title_elem.get_attribute('title') or title_elem.text.strip()
-                        param_value = subtitle_elem.get_attribute('title') or subtitle_elem.text.strip()
+                        title_text = (title_elem.get_attribute('title') or _get_text_js(title_elem) or "").strip()
+                        subtitle_text = (subtitle_elem.get_attribute('title') or _get_text_js(subtitle_elem) or "").strip()
+
+                        # Emphasis cards put the value in the "title" element and the label in the "subtitle" element
+                        if is_emphasis:
+                            param_name, param_value = subtitle_text, title_text
+                        else:
+                            param_name, param_value = title_text, subtitle_text
+
+                        # Fallback: if one side is empty, try the other order
+                        if (not param_name or not param_value) and title_text and subtitle_text:
+                            param_name, param_value = param_value, param_name
+
                         if param_name and param_value:
                             details["parameters"][param_name] = param_value
                             print(f"    - Extracted: {param_name} = {param_value}")
