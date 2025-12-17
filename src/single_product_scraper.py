@@ -1,5 +1,6 @@
 
 import json
+import re
 import time
 import os
 import sys
@@ -25,6 +26,69 @@ def setup_driver():
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
     return driver
+
+def _get_text_js(el) -> str:
+    """优先用 DOM 属性取文本，避免 Selenium .text 为空的问题。"""
+    try:
+        text = el.get_attribute("textContent") or ""
+        text = text.strip()
+        if text:
+            return text
+    except Exception:
+        pass
+
+    try:
+        text = el.get_attribute("innerText") or ""
+        return text.strip()
+    except Exception:
+        return ""
+
+
+def extract_price_info(driver, timeout: int = 15) -> dict[str, str]:
+    wait = WebDriverWait(driver, timeout)
+    price_info: dict[str, str] = {}
+
+    price_wrap = wait.until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, '[class*="priceWrap--"]'))
+    )
+
+    # 券后：symbol + number
+    try:
+        hl = price_wrap.find_element(By.CSS_SELECTOR, '[class*="highlightPrice--"]')
+        symbol_el = hl.find_element(By.CSS_SELECTOR, '[class*="symbol--"]')
+        value_el = hl.find_element(By.CSS_SELECTOR, '[class*="text--"]')
+
+        symbol = _get_text_js(symbol_el)
+        value = _get_text_js(value_el)
+
+        if symbol and value:
+            price_info["coupon_price"] = f"{symbol}{value}"
+    except Exception:
+        pass
+
+    # 优惠前：可能是两个 text--，第一个是 ¥，第二个是数字
+    try:
+        sub = price_wrap.find_element(By.CSS_SELECTOR, '[class*="subPrice--"]')
+        text_els = sub.find_elements(By.CSS_SELECTOR, '[class*="text--"]')
+        parts = [_get_text_js(e) for e in text_els]
+        joined = "".join([p for p in parts if p])
+
+        m = re.search(r"¥\s*(\d+(?:\.\d+)?)", joined)
+        if m:
+            price_info["original_price"] = f"¥{m.group(1)}"
+    except Exception:
+        pass
+
+    # 已售
+    try:
+        sales_el = price_wrap.find_element(By.CSS_SELECTOR, '[class*="salesDesc--"]')
+        sales_text = _get_text_js(sales_el)
+        if sales_text:
+            price_info["sales"] = sales_text.replace("\n", " ").strip()
+    except Exception:
+        pass
+
+    return price_info
 
 def scrape_single_product(driver, product_url):
     """
@@ -221,10 +285,31 @@ def scrape_single_product(driver, product_url):
 
             # 2. Click the style to trigger updates (only if available)
             initial_img_src = None
+            # Define main image selectors here to make them available in later code blocks
+            main_img_selectors = [
+                '#mainPicImageEl',  # Original ID selector
+                '[id*="mainPic"]',  # Partial ID match
+                'img[class*="mainPic"]',  # Class containing mainPic
+                '.pic-view img',  # Common picture viewer structure
+                '.pic img:first',  # First image in pic container
+                '[class*="pic--"] img:first',  # CSS module pic container
+                '[class*="image--"] img:first',  # CSS module image container
+            ]
+
             if style_is_available:
                 try:
                     # Get the current main image URL to detect changes later
-                    initial_img_src = driver.find_element(By.ID, "mainPicImageEl").get_attribute('src')
+                    # Try multiple possible selectors for the main image
+                    main_img = None
+                    for selector in main_img_selectors:
+                        try:
+                            main_img = driver.find_element(By.CSS_SELECTOR, selector)
+                            initial_img_src = main_img.get_attribute('src')
+                            print(f"  - Found main image with selector: {selector}")
+                            break
+                        except NoSuchElementException:
+                            continue
+
                     driver.execute_script("arguments[0].click();", style_element)
                 except Exception as e:
                     print(f"  - Could not click on style '{style_data['style_name']}'. Error: {e}")
@@ -237,17 +322,23 @@ def scrape_single_product(driver, product_url):
                 try:
                     # Wait a moment for the image to load
                     time.sleep(0.5)
-                    # Get the main image element - it has id="mainPicImageEl"
-                    main_img = driver.find_element(By.ID, "mainPicImageEl")
-                    current_img_src = main_img.get_attribute('src')
+                    # Try to find the main image element again with multiple selectors
+                    current_img_src = None
+                    for selector in main_img_selectors:
+                        try:
+                            main_img = driver.find_element(By.CSS_SELECTOR, selector)
+                            current_img_src = main_img.get_attribute('src')
+                            break
+                        except NoSuchElementException:
+                            continue
 
-                    if current_img_src != initial_img_src:
+                    if current_img_src and current_img_src != initial_img_src:
                         style_data["image_url"] = current_img_src
                         print("  - Image updated successfully.")
                     else:
                         # If we already got the image from the thumbnail, use that
                         if style_data.get("image_url") == "N/A":
-                            style_data["image_url"] = current_img_src
+                            style_data["image_url"] = current_img_src or initial_img_src
                         print("  - Using current image URL.")
                 except Exception as e:
                     print(f"  - Error getting main image: {e}")
@@ -335,9 +426,12 @@ def scrape_single_product(driver, product_url):
         print(f"An unexpected error occurred: {e}")
         return None
 
-    # Extract product title and shop info
+    # Extract product title, shop info, and other details
     product_title = ""
     shop_info = {}
+    shipping_info = {}
+    price_info = {}
+    coupon_info = []
 
     try:
         # Extract product title
@@ -400,12 +494,64 @@ def scrape_single_product(driver, product_url):
             'good_review_rate': ""
         }
 
+    # Extract shipping information
+    try:
+        shipping_container = driver.find_element(By.CSS_SELECTOR, '[class*="SecondCard--"]')
+        # Get delivery info
+        delivery_elem = shipping_container.find_element(By.CSS_SELECTOR, '[class*="DomesticDelivery--"]')
+        if delivery_elem:
+            shipping_elem = delivery_elem.find_element(By.CSS_SELECTOR, '[class*="shipping--"]')
+            if shipping_elem:
+                shipping_info['delivery'] = shipping_elem.text.strip()
+
+            freight_elem = delivery_elem.find_element(By.CSS_SELECTOR, '[class*="freight--"]')
+            if freight_elem:
+                shipping_info['freight'] = freight_elem.text.strip()
+
+            addr_elem = delivery_elem.find_element(By.CSS_SELECTOR, '[class*="deliveryAddrWrap--"] span')
+            if addr_elem:
+                shipping_info['delivery_address'] = addr_elem.text.strip()
+
+        # Get guarantee info
+        guarantee_elem = shipping_container.find_element(By.CSS_SELECTOR, '[class*="GuaranteeInfo--"]')
+        if guarantee_elem:
+            guarantee_texts = guarantee_elem.find_elements(By.CSS_SELECTOR, '[class*="guaranteeText--"]')
+            shipping_info['guarantees'] = [g.text.strip() for g in guarantee_texts if g.text.strip()]
+    except Exception as e:
+        print(f"Error extracting shipping info: {e}")
+    # Extract price information
+    try:
+        print("Starting price extraction...")
+        price_info = extract_price_info(driver)
+        print(f"Final price info: {price_info}")
+    except Exception as e:
+        print(f"Error extracting price info: {e}")
+        price_info = {}
+
+
+    # Extract coupon information
+    try:
+        coupon_container = driver.find_element(By.CSS_SELECTOR, '[class*="couponInfoArea--"]')
+        coupon_list = coupon_container.find_elements(By.CSS_SELECTOR, '[class*="couponWrap--"]')
+        for coupon in coupon_list:
+            coupon_elem = coupon.find_element(By.CSS_SELECTOR, '[class*="couponText--"]')
+            if coupon_elem:
+                coupon_info.append({
+                    'title': coupon_elem.get_attribute('title'),
+                    'text': coupon_elem.text.strip()
+                })
+    except Exception as e:
+        print(f"Error extracting coupon info: {e}")
+
     # Prepare final result with all data
     result = {
         "product_info": {
             "title": product_title,
             "url": product_url,
-            "shop": shop_info
+            "shop": shop_info,
+            "shipping": shipping_info,
+            "price": price_info,
+            "coupons": coupon_info
         },
         "styles": all_styles_data,
         "product_details": scrape_product_details(driver)
@@ -756,12 +902,46 @@ def main():
                 f.write(f"Title: {product_basic_info.get('title', 'N/A')}\n")
                 f.write(f"URL: {product_basic_info.get('url', 'N/A')}\n")
 
+                # Write shop information
                 shop_info = product_basic_info.get('shop', {})
-                f.write(f"\nShop Information:\n")
+                f.write("\nShop Information:\n")
                 f.write(f"  Name: {shop_info.get('name', 'N/A')}\n")
                 f.write(f"  URL: {shop_info.get('url', 'N/A')}\n")
                 f.write(f"  Rating: {shop_info.get('rating', 'N/A')}\n")
                 f.write(f"  Good Review Rate: {shop_info.get('good_review_rate', 'N/A')}\n")
+
+                # Write shipping information
+                shipping_info = product_basic_info.get('shipping', {})
+                if shipping_info:
+                    f.write("\nShipping Information:\n")
+                    if shipping_info.get('delivery'):
+                        f.write(f"  Delivery: {shipping_info['delivery']}\n")
+                    if shipping_info.get('freight'):
+                        f.write(f"  Freight: {shipping_info['freight']}\n")
+                    if shipping_info.get('delivery_address'):
+                        f.write(f"  Delivery Address: {shipping_info['delivery_address']}\n")
+                    if shipping_info.get('guarantees'):
+                        f.write(f"  Guarantees: {', '.join(shipping_info['guarantees'])}\n")
+
+                # Write price information
+                price_info = product_basic_info.get('price', {})
+                if price_info:
+                    f.write("\nPrice Information:\n")
+                    if price_info.get('coupon_price'):
+                        f.write(f"  券后: {price_info['coupon_price']}\n")
+                    if price_info.get('original_price'):
+                        f.write(f"  优惠前: {price_info['original_price']}\n")
+                    if price_info.get('sales'):
+                        f.write(f"  Sales: {price_info['sales']}\n")
+
+
+                # Write coupon information
+                coupons = product_basic_info.get('coupons', [])
+                if coupons:
+                    f.write("\nCoupons:\n")
+                    for i, coupon in enumerate(coupons, 1):
+                        f.write(f"  {i}. {coupon.get('text', 'N/A')}\n")
+
                 f.write("\n")
 
                 # Write styles
