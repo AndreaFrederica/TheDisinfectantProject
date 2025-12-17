@@ -408,6 +408,18 @@ def _run_ocr_core(ocr_client, img_path: str, source: Optional[str] = None) -> Op
         return {"full_text": "\n".join(texts), "lines": lines}
 
     try:
+        max_skip_width = 2000  # Heuristic: treat ultra-wide images as photos and skip OCR
+        w = h = None
+        try:
+            from PIL import Image
+            with Image.open(img_path) as im:
+                w, h = im.size
+            if w and w > max_skip_width:
+                print(f"Skip OCR for wide image ({w}x{h}) at {source or img_path}")
+                return None
+        except Exception:
+            pass
+
         # Optional resize if image is too large for default paddle limits
         resize_path = None
         try:
