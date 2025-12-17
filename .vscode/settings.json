@@ -4,7 +4,12 @@
         "beautifulsoup",
         "cand",
         "lxml",
+        "paddleocr",
+        "paddlepaddle",
         "pycache",
-        "pypi"
+        "pypi",
+        "Snipaste",
+        "textline",
+        "unwarping"
     ]
 }
