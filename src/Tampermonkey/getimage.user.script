@@ -1,0 +1,81 @@
+// ==UserScript==
+// @name         Expose Image Fetch API for Selenium
+// @namespace    selenium-bridge
+// @version      1.0
+// @match        https://img.alicdn.com/*
+// @grant        GM_xmlhttpRequest
+// @connect      img.alicdn.com
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /**
+   * 供 Selenium 调用：
+   * await window.__GET_IMAGE_BASE64__()
+   *
+   * return:
+   *  {
+   *    ok: true,
+   *    mime: "image/jpeg",
+   *    base64: "...."
+   *  }
+   * or
+   *  {
+   *    ok: false,
+   *    error: "reason"
+   *  }
+   */
+  window.__GET_IMAGE_BASE64__ = function () {
+    return new Promise((resolve) => {
+      const img = document.images && document.images[0];
+      if (!img || !img.src) {
+        resolve({ ok: false, error: 'img not found' });
+        return;
+      }
+
+      const url = img.src;
+      const referer = document.referrer || 'https://www.taobao.com/';
+
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        responseType: 'arraybuffer',
+        withCredentials: true,
+        headers: {
+          // 某些 alicdn 资源需要 Referer
+          Referer: referer,
+        },
+        onload: (r) => {
+          if (r.status < 200 || r.status >= 300) {
+            resolve({ ok: false, error: `HTTP ${r.status}` });
+            return;
+          }
+
+          const bytes = new Uint8Array(r.response);
+          let binary = '';
+          for (let i = 0; i < bytes.length; i++) {
+            binary += String.fromCharCode(bytes[i]);
+          }
+
+          const base64 = btoa(binary);
+          const mime =
+            r.responseHeaders.match(/content-type:\s*(.*)/i)?.[1]?.trim()
+            || 'image/jpeg';
+
+          resolve({
+            ok: true,
+            mime,
+            base64,
+          });
+        },
+        onerror: () => {
+          resolve({ ok: false, error: 'GM_xmlhttpRequest failed' });
+        },
+      });
+    });
+  };
+
+  // 可选：告诉你接口已就绪（调试用）
+  console.debug('[TM] __GET_IMAGE_BASE64__ ready');
+})();

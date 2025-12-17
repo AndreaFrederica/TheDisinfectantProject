@@ -1,19 +1,42 @@
 
+import base64
+import io
+import hashlib
 import json
 import re
 import time
 import os
 import sys
+import tempfile
 from datetime import datetime
 from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
+from urllib.parse import urlparse
+
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.core.driver_cache import DriverCacheManager
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
+
+
+@dataclass
+class OCRTextLine:
+    """Single OCR line with text, score and bounding box."""
+    text: str
+    score: Optional[float]
+    box: List[List[float]]
+
+
+@dataclass
+class OCRResult:
+    """OCR result for a single image."""
+    image_url: str
+    full_text: str
+    lines: List[OCRTextLine] = field(default_factory=list)
 
 
 @dataclass
@@ -30,6 +53,7 @@ class StyleInfo:
     image_url: str
     available: bool
     sizes: List[SizeInfo]
+    ocr: Optional[OCRResult] = None
 
 
 @dataclass
@@ -82,6 +106,9 @@ class ProductDetails:
     parameters_raw: str
     image_details: List[str]
     image_details_raw: str
+    image_details_ocr: List[OCRResult] = field(default_factory=list)
+    main_images_ocr_text: str = ""
+    detail_images_ocr_text: str = ""
 
 
 @dataclass
@@ -113,10 +140,287 @@ def setup_driver():
     options.add_argument("--start-maximized")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument('--ignore-certificate-errors')
-    service = Service(ChromeDriverManager().install())
+    driver_cache_dir = os.path.abspath(os.path.join(profile_path, "driver_cache"))
+    os.makedirs(driver_cache_dir, exist_ok=True)
+    cache_manager = DriverCacheManager(root_dir=driver_cache_dir, valid_range=30)
+    service = Service(ChromeDriverManager(cache_manager=cache_manager).install())
     driver = webdriver.Chrome(service=service, options=options)
     return driver
 
+
+# OCR helpers
+_ocr_client = None
+
+
+def _get_ocr_client():
+    """Lazily create and cache a PaddleOCR client."""
+    global _ocr_client
+    if _ocr_client is not None:
+        return _ocr_client
+
+    try:
+        from paddleocr import PaddleOCR
+    except Exception as exc:  # ImportError or runtime errors
+        print(f"OCR library not available: {exc}")
+        return None
+
+    try:
+        _ocr_client = PaddleOCR(
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False
+        )
+    except Exception as exc:
+        print(f"Failed to initialize PaddleOCR: {exc}")
+        _ocr_client = None
+    return _ocr_client
+
+
+def _run_ocr_from_url(image_url: str, cache: Optional[Dict[str, Any]] = None, driver=None,
+                      referer: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Download image from URL and run OCR. Caches by URL to avoid duplicate downloads.
+    Returns a serializable dict with full_text and line details.
+    """
+    if not image_url:
+        return None
+
+    if cache is not None and image_url in cache:
+        return cache[image_url]
+
+    ocr_client = _get_ocr_client()
+    if ocr_client is None:
+        if cache is not None:
+            cache[image_url] = None
+        return None
+
+    tmp_path = None
+    result_dict: Optional[Dict[str, Any]] = None
+    try:
+        content = _fetch_image_bytes(image_url, driver=driver, referer=referer)
+        if content is None:
+            raise RuntimeError("Could not fetch image for OCR")
+
+        parsed = urlparse(image_url)
+        suffix = (os.path.splitext(parsed.path)[1] or ".jpg").lower()
+        allowed = {".jpg", ".jpeg", ".png", ".bmp", ".pdf"}
+
+        if suffix not in allowed:
+            try:
+                from PIL import Image
+
+                img = Image.open(io.BytesIO(content)).convert("RGB")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
+                    img.save(tmp_file, format="PNG")
+                    tmp_path = tmp_file.name
+            except Exception as exc:
+                print(f"Failed to convert image for OCR {image_url}: {exc}")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
+                    tmp_file.write(content)
+                    tmp_path = tmp_file.name
+        else:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+                tmp_file.write(content)
+                tmp_path = tmp_file.name
+
+        result_dict = _run_ocr_core(ocr_client, tmp_path, source=image_url)
+    except Exception as exc:
+        print(f"OCR failed for {image_url}: {exc}")
+        result_dict = None
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    if cache is not None:
+        cache[image_url] = result_dict
+    return result_dict
+
+
+def _run_ocr_from_file(file_path: str, cache: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """Run OCR on a local file; converts unsupported formats to PNG."""
+    if not file_path or not os.path.exists(file_path):
+        return None
+    if os.path.getsize(file_path) == 0:
+        print(f"OCR skipped empty file {file_path}")
+        return None
+    cache_key = os.path.abspath(file_path)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
+    ocr_client = _get_ocr_client()
+    if ocr_client is None:
+        if cache is not None:
+            cache[cache_key] = None
+        return None
+
+    tmp_path = None
+    result_dict: Optional[Dict[str, Any]] = None
+    try:
+        suffix = (os.path.splitext(file_path)[1] or ".jpg").lower()
+        allowed = {".jpg", ".jpeg", ".png", ".bmp", ".pdf"}
+
+        src_path = file_path
+        if suffix not in allowed:
+            try:
+                from PIL import Image
+
+                with open(file_path, "rb") as f:
+                    content = f.read()
+                img = Image.open(io.BytesIO(content)).convert("RGB")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
+                    img.save(tmp_file, format="PNG")
+                    src_path = tmp_file.name
+                    tmp_path = tmp_file.name
+            except Exception as exc:
+                print(f"Failed to convert image for OCR {file_path}: {exc}")
+                src_path = file_path
+        else:
+            src_path = file_path
+
+        # If conversion failed but we still need a temp file fallback, ensure src_path exists
+        if not os.path.exists(src_path):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
+                tmp_file.write(open(file_path, "rb").read())
+                src_path = tmp_file.name
+                tmp_path = tmp_file.name
+
+        result_dict = _run_ocr_core(ocr_client, src_path, source=file_path)
+    except Exception as exc:
+        print(f"OCR failed for file {file_path}: {exc}")
+        result_dict = None
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    if cache is not None:
+        cache[cache_key] = result_dict
+    return result_dict
+
+
+def _run_ocr_core(ocr_client, img_path: str, source: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Run OCR with predict() when available, else fallback to ocr()."""
+    def _parse_ocr_raw(ocr_raw) -> Dict[str, Any]:
+        lines: List[Dict[str, Any]] = []
+        texts: List[str] = []
+        for page in ocr_raw or []:
+            for entry in page or []:
+                if not entry or len(entry) < 2:
+                    continue
+                box = entry[0]
+                text_info = entry[1]
+                text = ""
+                score = None
+                if isinstance(text_info, (list, tuple)):
+                    if text_info:
+                        text = text_info[0]
+                    if len(text_info) > 1:
+                        score = text_info[1]
+                else:
+                    text = str(text_info)
+                if text:
+                    texts.append(text)
+                try:
+                    normalized_box = [[float(pt[0]), float(pt[1])] for pt in box]
+                except Exception:
+                    normalized_box = []
+                lines.append({
+                    "text": text,
+                    "score": float(score) if score is not None else None,
+                    "box": normalized_box
+                })
+        return {"full_text": "\n".join(texts), "lines": lines}
+
+    def _parse_predict_raw(pred_raw) -> Dict[str, Any]:
+        lines: List[Dict[str, Any]] = []
+        texts: List[str] = []
+        for item in pred_raw or []:
+            if hasattr(item, "boxes") and hasattr(item, "texts"):
+                boxes = item.boxes
+                texts_list = item.texts
+                scores = getattr(item, "scores", [None] * len(texts_list))
+                for b, t, s in zip(boxes, texts_list, scores):
+                    texts.append(t)
+                    try:
+                        normalized_box = [[float(pt[0]), float(pt[1])] for pt in b]
+                    except Exception:
+                        normalized_box = []
+                    lines.append({
+                        "text": t,
+                        "score": float(s) if s is not None else None,
+                        "box": normalized_box
+                    })
+            elif hasattr(item, "text"):
+                t = getattr(item, "text", "")
+                s = getattr(item, "score", None)
+                b = getattr(item, "box", []) or getattr(item, "boxes", [])
+                texts.append(t)
+                try:
+                    normalized_box = [[float(pt[0]), float(pt[1])] for pt in b]
+                except Exception:
+                    normalized_box = []
+                lines.append({
+                    "text": t,
+                    "score": float(s) if s is not None else None,
+                    "box": normalized_box
+                })
+            elif hasattr(item, "res"):
+                try:
+                    r = item.res
+                    rec_texts = r.get("rec_texts", []) if isinstance(r, dict) else []
+                    rec_polys = r.get("rec_polys", []) if isinstance(r, dict) else []
+                    rec_scores = r.get("rec_scores", []) if isinstance(r, dict) else []
+                    for t, b, s in zip(rec_texts, rec_polys, rec_scores):
+                        texts.append(t)
+                        try:
+                            normalized_box = [[float(pt[0]), float(pt[1])] for pt in b]
+                        except Exception:
+                            normalized_box = []
+                        lines.append({
+                            "text": t,
+                            "score": float(s) if s is not None else None,
+                            "box": normalized_box
+                        })
+                except Exception:
+                    continue
+            elif isinstance(item, dict) and "rec_texts" in item:
+                rec_texts = item.get("rec_texts", [])
+                rec_polys = item.get("rec_polys", [])
+                rec_scores = item.get("rec_scores", [])
+                for t, b, s in zip(rec_texts, rec_polys, rec_scores):
+                    texts.append(t)
+                    try:
+                        normalized_box = [[float(pt[0]), float(pt[1])] for pt in b]
+                    except Exception:
+                        normalized_box = []
+                    lines.append({
+                        "text": t,
+                        "score": float(s) if s is not None else None,
+                        "box": normalized_box
+                    })
+        if not lines:
+            return _parse_ocr_raw(None)
+        return {"full_text": "\n".join(texts), "lines": lines}
+
+    try:
+        if hasattr(ocr_client, "predict"):
+            try:
+                pred_raw = ocr_client.predict(img_path)
+                parsed = _parse_predict_raw(pred_raw)
+                return {"image_url": source or img_path, **parsed}
+            except Exception as exc:
+                print(f"OCR predict() failed for {source or img_path}: {exc}")
+        ocr_raw = ocr_client.ocr(img_path)
+        parsed = _parse_ocr_raw(ocr_raw)
+        return {"image_url": source or img_path, **parsed}
+    except Exception as exc:
+        print(f"OCR core failed for {source or img_path}: {exc}")
+        return None
 def _get_text_js(el) -> str:
     """优先用 DOM 属性取文本，避免 Selenium .text 为空的问题。"""
     try:
@@ -229,6 +533,7 @@ def scrape_single_product(driver, product_url):
     time.sleep(2)
 
     all_styles_data = []
+    ocr_cache: Dict[str, Any] = {}
 
     try:
         # Wait for the SKU component to be ready - try multiple possible selectors
@@ -647,6 +952,24 @@ def scrape_single_product(driver, product_url):
     except Exception as e:
         print(f"Error extracting coupon info: {e}")
 
+    # Aggregate OCR text from style main images
+    main_image_ocr_texts = []
+    for style in all_styles_data:
+        ocr_block = style.get("ocr") if isinstance(style, dict) else None
+        if ocr_block and ocr_block.get("full_text"):
+            main_image_ocr_texts.append(ocr_block["full_text"])
+
+    details_data = scrape_product_details(driver, ocr_cache=ocr_cache, product_url=product_url)
+    if main_image_ocr_texts:
+        # Deduplicate while preserving order
+        seen = set()
+        unique_texts = []
+        for text in main_image_ocr_texts:
+            if text not in seen:
+                seen.add(text)
+                unique_texts.append(text)
+        details_data["main_images_ocr_text"] = "\n".join(unique_texts)
+
     # Prepare final result with all data
     result = {
         "product_info": {
@@ -658,19 +981,22 @@ def scrape_single_product(driver, product_url):
             "coupons": coupon_info
         },
         "styles": all_styles_data,
-        "product_details": scrape_product_details(driver)
+        "product_details": details_data
     }
 
     return result
 
-def scrape_product_details(driver):
+def scrape_product_details(driver, ocr_cache: Optional[Dict[str, Any]] = None, product_url: Optional[str] = None):
     """Scrape product details including reviews, parameters and image details"""
     details = {
         "reviews": [],
         "parameters": {},
         "parameters_raw": "",  # Store raw DOM for parameters
         "image_details": [],
-        "image_details_raw": ""  # Store raw DOM for image details
+        "image_details_raw": "",  # Store raw DOM for image details
+        "image_details_ocr": [],
+        "main_images_ocr_text": "",
+        "detail_images_ocr_text": ""
     }
 
     try:
@@ -934,6 +1260,7 @@ def scrape_product_details(driver):
 
                     print(f"  - Found {len(details['image_details'])} images in 图文详情")
                     print(f"  - Raw image details DOM saved: {len(details['image_details_raw'])} characters")
+
                 except Exception as e:
                     print(f"  - Error extracting images from tab: {str(e)}")
                     # Still save the tab DOM even if extraction fails
@@ -1007,7 +1334,7 @@ def scrape_product_data(product_url: str, driver=None, save_to_file: bool = Fals
 
         # Save to file if requested
         if save_to_file:
-            _save_product_data_to_files(product_data, result_dict, output_folder)
+            _save_product_data_to_files(product_data, result_dict, output_folder, driver=driver)
 
         return product_data
 
@@ -1015,6 +1342,25 @@ def scrape_product_data(product_url: str, driver=None, save_to_file: bool = Fals
         # Close driver only if we created it OR if close_driver is explicitly True
         if driver_created or close_driver:
             driver.quit()
+
+
+def _dict_to_ocr_result(data: Dict[str, Any]) -> OCRResult:
+    """Convert a raw OCR dict to OCRResult dataclass."""
+    lines = []
+    for line in data.get("lines", []):
+        try:
+            lines.append(OCRTextLine(
+                text=line.get("text", ""),
+                score=line.get("score"),
+                box=line.get("box", [])
+            ))
+        except Exception:
+            continue
+    return OCRResult(
+        image_url=data.get("image_url", ""),
+        full_text=data.get("full_text", ""),
+        lines=lines
+    )
 
 
 def _dict_to_product_data(data: Dict[str, Any]) -> ProductData:
@@ -1048,23 +1394,39 @@ def _dict_to_product_data(data: Dict[str, Any]) -> ProductData:
     styles = []
     for style_dict in data['styles']:
         sizes = [SizeInfo(**size_dict) for size_dict in style_dict.get('sizes', [])]
+        ocr_result = None
+        if style_dict.get('ocr'):
+            try:
+                ocr_result = _dict_to_ocr_result(style_dict['ocr'])
+            except Exception:
+                ocr_result = None
         style = StyleInfo(
             style_name=style_dict['style_name'],
             image_url=style_dict['image_url'],
             available=style_dict.get('available', True),
-            sizes=sizes
+            sizes=sizes,
+            ocr=ocr_result
         )
         styles.append(style)
 
     # Convert product details
     details_dict = data['product_details']
     reviews = [ReviewInfo(**review) for review in details_dict.get('reviews', [])]
+    image_detail_ocr = []
+    for ocr_item in details_dict.get('image_details_ocr', []):
+        try:
+            image_detail_ocr.append(_dict_to_ocr_result(ocr_item))
+        except Exception:
+            continue
     product_details = ProductDetails(
         reviews=reviews,
         parameters=details_dict.get('parameters', {}),
         parameters_raw=details_dict.get('parameters_raw', ''),
         image_details=details_dict.get('image_details', []),
-        image_details_raw=details_dict.get('image_details_raw', '')
+        image_details_raw=details_dict.get('image_details_raw', ''),
+        image_details_ocr=image_detail_ocr,
+        main_images_ocr_text=details_dict.get('main_images_ocr_text', ''),
+        detail_images_ocr_text=details_dict.get('detail_images_ocr_text', '')
     )
 
     return ProductData(
@@ -1074,8 +1436,172 @@ def _dict_to_product_data(data: Dict[str, Any]) -> ProductData:
     )
 
 
+def _browser_fetch_image(driver, url: str) -> Optional[bytes]:
+    """Fetch image via browser context (with cookies) and return bytes."""
+    if driver is None:
+        return None
+    try:
+        script = """
+        const url = arguments[0];
+        const callback = arguments[arguments.length - 1];
+        fetch(url, {credentials: 'include'})
+          .then(resp => resp.arrayBuffer())
+          .then(buf => {
+            const bytes = new Uint8Array(buf);
+            let binary = '';
+            const chunk = 8192;
+            for (let i = 0; i < bytes.length; i += chunk) {
+              const sub = bytes.subarray(i, i + chunk);
+              binary += String.fromCharCode.apply(null, sub);
+            }
+            const base64 = btoa(binary);
+            callback({ ok: true, base64 });
+          })
+          .catch(err => callback({ ok: false, error: String(err) }));
+        """
+        result = driver.execute_async_script(script, url)
+        if isinstance(result, dict) and result.get("ok") and result.get("base64"):
+            return base64.b64decode(result["base64"])
+    except Exception as exc:
+        print(f"Browser fetch failed for {url}: {exc}")
+    return None
+
+
+def _dom_fetch_image_new_tab(driver, url: str) -> Optional[bytes]:
+    """
+    Open a new tab, load the image URL, and尝试通过 Tampermonkey 暴露的 __GET_IMAGE_BASE64__ 获取。
+    若未注入脚本则退回 canvas/fetch 获取原始字节。
+    """
+    if driver is None:
+        return None
+    current_handle = driver.current_window_handle
+    data_bytes = None
+    try:
+        driver.execute_script("window.open('about:blank','_blank');")
+        new_handle = [h for h in driver.window_handles if h != current_handle][-1]
+        driver.switch_to.window(new_handle)
+        driver.get(url)
+        time.sleep(0.5)
+        script = r"""
+        const callback = arguments[arguments.length - 1];
+        const tryFetch = async () => {
+          // Preferred: Tampermonkey API
+          if (typeof window.__GET_IMAGE_BASE64__ === 'function') {
+            try {
+              const res = await window.__GET_IMAGE_BASE64__();
+              if (res && res.ok) return res;
+            } catch (e) {
+              // fall through
+            }
+          }
+
+          // Fallback: canvas -> dataURL
+          try {
+            const img = document.querySelector('img');
+            if (img && img.naturalWidth && img.naturalHeight) {
+              const canvas = document.createElement('canvas');
+              canvas.width = img.naturalWidth;
+              canvas.height = img.naturalHeight;
+              const ctx = canvas.getContext('2d');
+              ctx.drawImage(img, 0, 0);
+              const dataUrl = canvas.toDataURL('image/png');
+              return { ok: true, base64: dataUrl.split(',')[1], mime: 'image/png' };
+            }
+          } catch (e) {
+            // fall through
+          }
+
+          // Final fallback: fetch the URL with credentials
+          try {
+            const resp = await fetch(window.location.href, { credentials: 'include' });
+            const buf = await resp.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            let binary = '';
+            const chunk = 8192;
+            for (let i = 0; i < bytes.length; i += chunk) {
+              const sub = bytes.subarray(i, i + chunk);
+              binary += String.fromCharCode.apply(null, sub);
+            }
+            const base64 = btoa(binary);
+            const mime = resp.headers.get('content-type') || 'image/jpeg';
+            return { ok: true, base64, mime };
+          } catch (err) {
+            return { ok: false, error: String(err) };
+          }
+        };
+        tryFetch().then(res => callback(res)).catch(err => callback({ ok: false, error: String(err) }));
+        """
+        result = driver.execute_async_script(script)
+        if isinstance(result, dict) and result.get("ok") and result.get("base64"):
+            data_bytes = base64.b64decode(result["base64"])
+        else:
+            print(f"DOM fetch new tab failed for {url}: {result}")
+    except Exception as exc:
+        print(f"New tab DOM fetch failed for {url}: {exc}")
+    finally:
+        try:
+            driver.close()
+        except Exception:
+            pass
+        try:
+            driver.switch_to.window(current_handle)
+        except Exception:
+            pass
+    return data_bytes
+
+
+def _fetch_image_bytes(url: str, driver=None, referer: Optional[str] = None) -> Optional[bytes]:
+    """Fetch image bytes using the real browser context; prefer TM API via new tab first."""
+    # Prefer Tampermonkey bridge (new tab) so anti-hotlink is less likely to trigger.
+    content = _dom_fetch_image_new_tab(driver, url)
+    if content is None:
+        content = _browser_fetch_image(driver, url)
+    return content
+
+
+def _download_image(url: str, dest_dir: str, filename_prefix: str, index: int, driver=None,
+                   referer: Optional[str] = None) -> Optional[str]:
+    """Download image to destination directory, return local path on success."""
+    if not url:
+        return None
+    os.makedirs(dest_dir, exist_ok=True)
+
+    parsed = urlparse(url)
+    ext = os.path.splitext(parsed.path)[1]
+    if not ext or len(ext) > 5:
+        ext = ".jpg"
+    base_name = os.path.basename(parsed.path) or "img"
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", base_name)
+    short_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
+    filename = f"{filename_prefix}_{index}_{short_hash}{ext}"
+    local_path = os.path.join(dest_dir, filename)
+
+    content = _fetch_image_bytes(url, driver=driver, referer=referer)
+
+    if content is None:
+        try:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+        except OSError:
+            pass
+        return None
+
+    try:
+        with open(local_path, "wb") as f:
+            f.write(content)
+        return local_path
+    except Exception as exc:
+        print(f"Failed to save image {url}: {exc}")
+        try:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+        except OSError:
+            pass
+        return None
+
+
 def _save_product_data_to_files(product_data: ProductData, original_dict: Dict[str, Any],
-                               output_folder: Optional[str] = None):
+                               output_folder: Optional[str] = None, driver=None):
     """Save product data to files."""
     if output_folder is None:
         # Create timestamped folder
@@ -1087,8 +1613,117 @@ def _save_product_data_to_files(product_data: ProductData, original_dict: Dict[s
 
     print(f"Saving data to folder: {output_folder}")
 
-    # Save as JSON (convert dataclass to dict)
+    images_root = os.path.join(output_folder, "images")
+    main_image_dir = os.path.join(images_root, "main")
+    detail_image_dir = os.path.join(images_root, "detail")
+    os.makedirs(main_image_dir, exist_ok=True)
+    os.makedirs(detail_image_dir, exist_ok=True)
+
+    # Download images: main (style images) and detail images
+    manifest = {"main": [], "detail": []}
+
+    # Main images (styles)
+    seen_main = set()
+    referer = product_data.product_info.url
+
+    for idx, style in enumerate(product_data.styles, start=1):
+        img_url = style.image_url
+        if not img_url or img_url in seen_main:
+            continue
+        seen_main.add(img_url)
+        local_path = _download_image(img_url, main_image_dir, "main", idx, driver=driver, referer=referer)
+        if local_path:
+            manifest["main"].append({
+                "url": img_url,
+                "file": os.path.relpath(local_path, output_folder),
+                "original_filename": os.path.basename(urlparse(img_url).path)
+            })
+
+    # Detail images (图文详情)
+    seen_detail = set()
+    for idx, img_url in enumerate(product_data.product_details.image_details, start=1):
+        if not img_url or img_url in seen_detail:
+            continue
+        seen_detail.add(img_url)
+        local_path = _download_image(img_url, detail_image_dir, "detail", idx, driver=driver, referer=referer)
+        if local_path:
+            manifest["detail"].append({
+                "url": img_url,
+                "file": os.path.relpath(local_path, output_folder),
+                "original_filename": os.path.basename(urlparse(img_url).path)
+            })
+
+    manifest_path = os.path.join(images_root, "download_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    print(f"Image manifest saved to {manifest_path}")
+
+    # Run OCR using downloaded local files (avoid re-fetching)
+    ocr_file_cache: Dict[str, Any] = {}
+
+    # Styles main images OCR
+    main_map = {entry["url"]: entry["file"] for entry in manifest["main"]}
+    main_texts: List[str] = []
+    for style in product_data.styles:
+        img_url = style.image_url
+        if img_url in main_map:
+            local_rel = main_map[img_url]
+            local_path = os.path.join(output_folder, local_rel)
+            ocr_dict = _run_ocr_from_file(local_path, cache=ocr_file_cache)
+            if ocr_dict:
+                style.ocr = _dict_to_ocr_result(ocr_dict)
+                if style.ocr.full_text:
+                    main_texts.append(style.ocr.full_text)
+
+    # Detail images OCR
+    detail_map = {entry["url"]: entry["file"] for entry in manifest["detail"]}
+    detail_ocr_results: List[OCRResult] = []
+    for url in product_data.product_details.image_details:
+        if url in detail_map:
+            local_rel = detail_map[url]
+            local_path = os.path.join(output_folder, local_rel)
+            ocr_dict = _run_ocr_from_file(local_path, cache=ocr_file_cache)
+            if ocr_dict:
+                detail_ocr_results.append(_dict_to_ocr_result(ocr_dict))
+    if detail_ocr_results:
+        product_data.product_details.image_details_ocr = detail_ocr_results
+        texts = [r.full_text for r in detail_ocr_results if r.full_text]
+        product_data.product_details.detail_images_ocr_text = "\n".join(texts)
+    if main_texts:
+        # Deduplicate
+        seen = set()
+        unique_texts = []
+        for t in main_texts:
+            if t not in seen:
+                seen.add(t)
+                unique_texts.append(t)
+        product_data.product_details.main_images_ocr_text = "\n".join(unique_texts)
+
+    # Save as JSON (convert dataclass to dict) and replace image URLs with local paths
     json_data = asdict(product_data)
+
+    main_map = {entry["url"]: entry["file"] for entry in manifest["main"]}
+    detail_map = {entry["url"]: entry["file"] for entry in manifest["detail"]}
+
+    for style in json_data.get("styles", []):
+        url = style.get("image_url")
+        if url and url in main_map:
+            style["image_url_original"] = url
+            style["image_url"] = main_map[url]
+
+    details_dict = json_data.get("product_details", {})
+    if "image_details" in details_dict:
+        original_list = list(details_dict.get("image_details", []))
+        details_dict["image_details_original"] = original_list
+        replaced = []
+        for url in original_list:
+            if url in detail_map:
+                replaced.append(detail_map[url])
+            else:
+                replaced.append(url)
+        details_dict["image_details"] = replaced
+        json_data["product_details"] = details_dict
+
     filename = os.path.join(output_folder, "product_data.json")
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(json_data, f, indent=2, ensure_ascii=False)

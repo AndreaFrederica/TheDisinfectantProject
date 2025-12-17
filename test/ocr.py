@@ -12,7 +12,7 @@ ocr = PaddleOCR(
 #     use_doc_orientation_classify=False,
 #     use_doc_unwarping=False,
 #     use_textline_orientation=False) # 更换 PP-OCRv5_mobile 模型
-result = ocr.predict("R:/Snipaste_2025-12-17_21-38-26.png")
+result = ocr.predict("scraped_data\\shop_scrape_20251218_032731\\products\\707189523806\\images\\detail\\detail_11_695b0c2b.jpg")
 for res in result:
     res.print()
     res.save_to_img("output")

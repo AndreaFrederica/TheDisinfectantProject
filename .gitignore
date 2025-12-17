@@ -6,3 +6,5 @@ novel-helper
 __pycache__/
 chrome_profile/
 scraped_data/
+output/
+backups/

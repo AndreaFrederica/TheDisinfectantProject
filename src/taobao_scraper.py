@@ -7,6 +7,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.core.driver_cache import DriverCacheManager
 from single_product_scraper import scrape_product_data, ProductData, asdict
 
 # --- Configuration and Setup ---
@@ -31,11 +32,15 @@ def setup_driver():
     options.add_argument("--start-maximized")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument('--ignore-certificate-errors')
-    
+    os.makedirs(profile_path, exist_ok=True)
+
     # 开启浏览器日志记录
     options.set_capability('goog:loggingPrefs', {'browser': 'ALL'})
     
-    service = Service(ChromeDriverManager().install())
+    driver_cache_dir = os.path.abspath(os.path.join(profile_path, "driver_cache"))
+    os.makedirs(driver_cache_dir, exist_ok=True)
+    cache_manager = DriverCacheManager(root_dir=driver_cache_dir, valid_range=30)
+    service = Service(ChromeDriverManager(cache_manager=cache_manager).install())
     driver = webdriver.Chrome(service=service, options=options)
     return driver
 
