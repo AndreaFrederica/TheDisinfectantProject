@@ -8,14 +8,15 @@
 
 ## 项目状态
 
-⚠️ **开发中项目**
-- 当前版本：v0.1.0 (Demo 版本)
-- 主要功能模块仍在开发和优化中
-- 仅 [`single_product_scraper.py`](src/single_product_scraper.py) 模块相对稳定可用
+✅ **可用版本**
+- 当前版本：v0.2.0
+- 两个主要功能模块已完成并可用：
+  - 单个商品详情爬取 ([`single_product_scraper.py`](src/single_product_scraper.py))
+  - 批量店铺商品爬取 ([`taobao_scraper.py`](src/taobao_scraper.py))
 
 ## 已实现功能
 
-### ✅ 单个商品详情爬取 ([`single_product_scraper.py`](src/single_product_scraper.py)) - **推荐使用**
+### ✅ 单个商品详情爬取 ([`single_product_scraper.py`](src/single_product_scraper.py))
 - **功能**：爬取单个淘宝商品的完整信息，包括：
   - 商品标题和店铺信息
   - 所有颜色/款式变体及其图片
@@ -23,17 +24,33 @@
   - 用户评价（前5条）
   - 商品参数详情
   - 图文详情中的所有图片
+  - 价格信息和优惠券信息
 - **输出格式**：JSON + 可读文本 + 原始 HTML 保存
+- **特点**：结构化数据返回，支持传入现有 WebDriver 实例
+
+### ✅ 批量店铺商品爬取 ([`taobao_scraper.py`](src/taobao_scraper.py)) - **已可用**
+- **功能**：批量爬取指定店铺中的所有商品信息，包括：
+  - 自动获取店铺内所有商品链接
+  - 爬取每个商品的完整详细信息
+  - 生成索引 CSV 文件和任务汇总报告
+  - 详细的运行日志记录
+- **输出结构**：
+  ```
+  scraped_data/shop_scrape_[时间戳]/
+  ├── scraping.log              # 爬取日志
+  ├── index.csv                 # 商品索引汇总
+  ├── task_summary.txt          # 任务报告
+  ├── shop_[店铺名].txt          # 各店铺汇总
+  └── products/                 # 商品详情目录
+      └── [商品ID]/
+          ├── product_data.json
+          ├── product_data_readable.txt
+          ├── parameters_raw.html
+          └── image_details_raw.html
+  ```
+- **特点**：支持多店铺配置，完整保留所有原始数据
 
 ## 开发中功能
-
-### 🚧 批量店铺商品爬取 ([`taobao_scraper.py`](src/taobao_scraper.py))
-- **状态**：开发中，功能不完整
-- **计划功能**：
-  - 批量爬取指定店铺中的所有商品信息
-  - 支持多店铺配置（通过 [`shops.json5`](src/shops.json5)）
-  - 自动翻页和商品链接获取
-  - 输出 CSV 格式的商品数据
 
 ### 🚧 商品详情页辅助爬取 ([`detail_scraper.py`](src/detail_scraper.py))
 - **状态**：辅助模块，功能有限
@@ -87,7 +104,7 @@ pip install selenium webdriver-manager pyjson5 json5 beautifulsoup4 html5lib
 
 ## 快速开始
 
-### 爬取单个商品（当前推荐用法）
+### 1. 爬取单个商品
 
 ```bash
 # 使用默认URL
@@ -103,9 +120,33 @@ python src/single_product_scraper.py "https://item.taobao.com/item.htm?id=123456
 - `parameters_raw.html` - 原始参数HTML（调试用）
 - `image_details_raw.html` - 原始图文详情HTML（调试用）
 
-### 其他模块（开发中）
+### 2. 批量爬取店铺商品（新功能）
 
-批量爬取功能正在开发中，暂时不建议在生产环境使用。
+```bash
+# 直接运行（使用 shops.json5 配置）
+python src/taobao_scraper.py
+```
+
+输出文件将保存在 `scraped_data/shop_scrape_[时间戳]/` 目录下：
+- `scraping.log` - 详细的爬取日志
+- `index.csv` - 所有商品的索引汇总
+- `task_summary.txt` - 任务完成报告
+- `shop_[店铺名].txt` - 各店铺的商品列表
+- `products/` - 每个商品的详细文件夹
+
+### 3. 在其他程序中使用
+
+```python
+from src.single_product_scraper import scrape_product_data
+from src.taobao_scraper import scrape_shops
+
+# 爬取单个商品
+product_data = scrape_product_data("https://item.taobao.com/item.htm?id=123456789")
+
+# 批量爬取店铺
+shops = [{"name": "店铺名", "url": "店铺URL"}]
+products = scrape_shops(shops, output_dir="my_output")
+```
 
 ## 输出数据格式
 
@@ -223,12 +264,13 @@ python src/single_product_scraper.py "https://item.taobao.com/item.htm?id=123456
 
 ## 未来计划
 
-- [ ] 完善批量爬取功能
-- [ ] 增加更多电商平台支持
-- [ ] 优化数据采集效率
-- [ ] 添加数据清洗和验证
-- [ ] 实现 API 接口供前端调用
+- [ ] 增加更多电商平台支持（天猫、京东等）
+- [ ] 优化数据采集效率和并发处理
+- [ ] 添加数据清洗和验证功能
+- [ ] 实现 RESTful API 接口供前端调用
 - [ ] 增加分布式爬取支持
+- [ ] 添加增量更新功能，避免重复爬取
+- [ ] 实现数据可视化和统计分析模块
 
 ## 贡献
 
