@@ -87,7 +87,15 @@ def scrape_single_product(driver, product_url):
             for item in sku_items:
                 try:
                     # Look for span with title="颜色分类" or containing "颜色" text
-                    label_span = item.find_element(By.XPATH, './/span[@title="颜色分类" or contains(text(), "颜色")]')
+                    # Try multiple possible label texts (e.g. 颜色分类, 颜色, 口味, 款式, 风格, 规格)
+                    label_span = None
+                    label_candidates = ["颜色分类", "颜色", "口味", "款式", "风格", "规格"]
+                    for cand in label_candidates:
+                        try:
+                            label_span = item.find_element(By.XPATH, f'.//span[@title="{cand}" or contains(text(), "{cand}")]')
+                            break
+                        except NoSuchElementException:
+                            continue
                     if label_span:
                         color_sku_item = item
                         print(f"Found color SKU item with label: {label_span.text}")
@@ -101,16 +109,27 @@ def scrape_single_product(driver, product_url):
                 sku_value_wrap = color_sku_item.find_element(By.CSS_SELECTOR, '[class*="skuValueWrap"]')
                 # Then find the content div, and finally all valueItem elements within it
                 content_div = sku_value_wrap.find_element(By.CSS_SELECTOR, '[class*="content"]')
-                # Find all valueItem elements (this will find nested ones too, but we'll filter)
-                all_value_items = content_div.find_elements(By.CSS_SELECTOR, '[class*="valueItem"]')
+                # Find only direct child valueItem div elements to avoid duplicates
+                # Use XPath to find direct children
+                all_value_items = content_div.find_elements(By.XPATH, './div[contains(@class, "valueItem")]')
+                print(f"Debug: XPath found {len(all_value_items)} valueItem divs")
 
-                # Filter to only get top-level valueItem elements (those with hasImg class)
-                style_elements = []
-                for item in all_value_items:
-                    class_attr = item.get_attribute('class') or ''
-                    # Only include items that have hasImg class (these are the color options)
-                    if 'hasImg' in class_attr and 'valueItem' in class_attr:
-                        style_elements.append(item)
+                # If XPath doesn't work, try CSS selector as fallback
+                if len(all_value_items) == 0:
+                    print("Debug: XPath failed, trying CSS selector...")
+                    all_value_items = content_div.find_elements(By.CSS_SELECTOR, 'div.valueItem--smR4pNt4')
+                    print(f"Debug: CSS selector found {len(all_value_items)} elements")
+
+                    # If still nothing, try finding all divs
+                    if len(all_value_items) == 0:
+                        all_divs = content_div.find_elements(By.TAG_NAME, 'div')
+                        print(f"Debug: Found {len(all_divs)} total divs in content")
+                        for i, div in enumerate(all_divs):
+                            classes = div.get_attribute('class')
+                            print(f"  - Div {i}: class={classes}")
+
+                # All elements are already valueItem divs, no need to filter
+                style_elements = all_value_items
 
                 # Debug: Print the class names to understand what we're getting
                 print(f"Method 1 found {len(style_elements)} style elements")
@@ -257,8 +276,9 @@ def scrape_single_product(driver, product_url):
                     # Find the size options in the size section
                     sku_value_wrap = size_sku_item.find_element(By.CSS_SELECTOR, '[class*="skuValueWrap"]')
                     content_div = sku_value_wrap.find_element(By.CSS_SELECTOR, '[class*="content"]')
-                    # Find all valueItem elements within the content div
-                    size_elements = content_div.find_elements(By.CSS_SELECTOR, '[class*="valueItem"]')
+                    # Find only direct child valueItem div elements to avoid duplicates
+                    # Use XPath to find direct children
+                    size_elements = content_div.find_elements(By.XPATH, './div[contains(@class, "valueItem")]')
                     print(f"  - Debug: Found {len(size_elements)} size elements")
 
                     # Get all sizes with their availability
