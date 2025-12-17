@@ -408,19 +408,44 @@ def _run_ocr_core(ocr_client, img_path: str, source: Optional[str] = None) -> Op
         return {"full_text": "\n".join(texts), "lines": lines}
 
     try:
+        # Optional resize if image is too large for default paddle limits
+        resize_path = None
+        try:
+            from PIL import Image
+            with Image.open(img_path) as im:
+                w, h = im.size
+                max_side = 4000
+                if max(w, h) > max_side:
+                    scale = max_side / float(max(w, h))
+                    new_size = (int(w * scale), int(h * scale))
+                    im_resized = im.resize(new_size)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
+                        im_resized.save(tmp_file, format="PNG")
+                        resize_path = tmp_file.name
+        except Exception:
+            resize_path = None
+
+        final_path = resize_path or img_path
+
         if hasattr(ocr_client, "predict"):
             try:
-                pred_raw = ocr_client.predict(img_path)
+                pred_raw = ocr_client.predict(final_path)
                 parsed = _parse_predict_raw(pred_raw)
                 return {"image_url": source or img_path, **parsed}
             except Exception as exc:
                 print(f"OCR predict() failed for {source or img_path}: {exc}")
-        ocr_raw = ocr_client.ocr(img_path)
+        ocr_raw = ocr_client.ocr(final_path)
         parsed = _parse_ocr_raw(ocr_raw)
         return {"image_url": source or img_path, **parsed}
     except Exception as exc:
         print(f"OCR core failed for {source or img_path}: {exc}")
         return None
+    finally:
+        try:
+            if resize_path and os.path.exists(resize_path):
+                os.remove(resize_path)
+        except Exception:
+            pass
 def _get_text_js(el) -> str:
     """优先用 DOM 属性取文本，避免 Selenium .text 为空的问题。"""
     try:
