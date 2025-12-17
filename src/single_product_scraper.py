@@ -11,7 +11,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
 
 def setup_driver():
     """Initializes and returns a Chrome WebDriver instance."""
@@ -42,6 +42,37 @@ def _get_text_js(el) -> str:
         return text.strip()
     except Exception:
         return ""
+
+def _refind_sku_container(driver, wait):
+    """Re-find the SKU container after DOM updates."""
+    for selector in [
+        'div[class*="skuWrapper"]',
+        'div[class*="sku"]',
+        'div[class*="Sku"]',
+        '.tb-sku',
+        '.sku-inner'
+    ]:
+        try:
+            return wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
+        except TimeoutException:
+            continue
+    return None
+
+def _find_size_sku_item(sku_container):
+    """Find the size SKU item within the container."""
+    sku_items = sku_container.find_elements(By.CSS_SELECTOR, '[class*="skuItem"]')
+    label_candidates = ("尺码", "尺寸", "Size")
+    for item in sku_items:
+        for cand in label_candidates:
+            try:
+                item.find_element(
+                    By.XPATH,
+                    f'.//*[contains(@class,"labelWrap")]//*[normalize-space()="{cand}" or @title="{cand}"]'
+                )
+                return item
+            except NoSuchElementException:
+                pass
+    return None
 
 
 def extract_price_info(driver, timeout: int = 15) -> dict[str, str]:
@@ -349,65 +380,48 @@ def scrape_single_product(driver, product_url):
             # 4. Get sizes for the current style with their availability
             sizes = []
             try:
-                # After clicking a style (or if it's sold out), we need to find the size SKU section
-                size_sku_item = None
-                sku_items = sku_container.find_elements(By.CSS_SELECTOR, '[class*="skuItem"]')
+                # Key fix: Re-find SKU container after clicking style to avoid stale reference
+                sku_container = _refind_sku_container(driver, wait)
+                if not sku_container:
+                    raise RuntimeError("Failed to re-find sku_container after style click")
 
-                for item in sku_items:
-                    try:
-                        # Look for the item containing "尺码" text
-                        size_span = item.find_element(By.XPATH, './/span[@title="尺码" or contains(text(), "尺码")]')
-                        if size_span:
-                            size_sku_item = item
-                            break
-                    except NoSuchElementException:
-                        continue
-
-                if size_sku_item:
-                    # Find the size options in the size section
+                size_sku_item = _find_size_sku_item(sku_container)
+                if not size_sku_item:
+                    print("  - Could not find size SKU section")
+                    style_data["sizes"] = []
+                else:
                     sku_value_wrap = size_sku_item.find_element(By.CSS_SELECTOR, '[class*="skuValueWrap"]')
-                    content_div = sku_value_wrap.find_element(By.CSS_SELECTOR, '[class*="content"]')
-                    # Find only direct child valueItem div elements to avoid duplicates
-                    # Use XPath to find direct children
-                    size_elements = content_div.find_elements(By.XPATH, './div[contains(@class, "valueItem")]')
+                    content_div = sku_value_wrap.find_element(By.CSS_SELECTOR, '[class*="content--"], [class*="content"]')
+
+                    # Key fix: Use descendant find (//) instead of direct child (./) for robustness
+                    size_elements = content_div.find_elements(By.XPATH, './/div[contains(@class, "valueItem")]')
                     print(f"  - Debug: Found {len(size_elements)} size elements")
 
-                    # Get all sizes with their availability
                     for size_element in size_elements:
-                        # Get size name
                         try:
                             size_name_tag = size_element.find_element(By.CSS_SELECTOR, 'span[class*="valueItemText"]')
-                            size_name = size_name_tag.get_attribute('title') or size_name_tag.text.strip()
+                            size_name = size_name_tag.get_attribute('title') or _get_text_js(size_name_tag)
                         except Exception:
-                            # Fallback to direct text
-                            size_name = size_element.text.strip()
+                            size_name = _get_text_js(size_element) or size_element.get_attribute("title") or ""
 
+                        size_name = (size_name or "").strip()
                         if not size_name:
                             continue
 
-                        # Check size availability
                         size_data_disabled = size_element.get_attribute('data-disabled') or 'false'
-                        # Convert string to boolean for easier comparison
-                        size_is_available = size_data_disabled == 'false'
+                        size_is_available = (size_data_disabled == 'false')
 
-                        # Avoid duplicates - if size already exists, only add if not already in list
-                        existing_size = next((s for s in sizes if s['name'] == size_name), None)
-                        if not existing_size:
+                        # Avoid duplicates
+                        if not any(s['name'] == size_name for s in sizes):
                             sizes.append({
                                 "name": size_name,
                                 "available": size_is_available
                             })
                             print(f"    - Size {size_name}: {'有货' if size_is_available else '缺货'}")
-                        else:
-                            # Debug: print if we found a duplicate
-                            print(f"    - Debug: found duplicate size {size_name}, current: {existing_size['available']}, new: {size_is_available}")
 
                     style_data["sizes"] = sizes
                     available_size_names = [s['name'] for s in sizes if s['available']]
                     print(f"  - Available sizes: {available_size_names}")
-                else:
-                    print("  - Could not find size SKU section")
-
             except Exception as e:
                 print(f"  - Error getting sizes: {e}")
                 style_data["sizes"] = []
