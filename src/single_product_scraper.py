@@ -44,6 +44,8 @@ class SizeInfo:
     """Size information with availability"""
     name: str
     available: bool
+    price_coupon: Optional[str] = None
+    price_original: Optional[str] = None
 
 
 @dataclass
@@ -54,6 +56,8 @@ class StyleInfo:
     available: bool
     sizes: List[SizeInfo]
     ocr: Optional[OCRResult] = None
+    price_coupon: Optional[str] = None
+    price_original: Optional[str] = None
 
 
 @dataclass
@@ -570,6 +574,8 @@ def scrape_single_product(driver, product_url):
     time.sleep(2)
 
     all_styles_data = []
+    price_candidates_coupon: List[float] = []
+    price_candidates_original: List[float] = []
     ocr_cache: Dict[str, Any] = {}
 
     try:
@@ -843,13 +849,39 @@ def scrape_single_product(driver, product_url):
                         size_data_disabled = size_element.get_attribute('data-disabled') or 'false'
                         size_is_available = (size_data_disabled == 'false')
 
+                        price_coupon = None
+                        price_original = None
+
+                        if size_is_available:
+                            try:
+                                driver.execute_script("arguments[0].click();", size_element)
+                                time.sleep(0.3)
+                                combo_price = extract_price_info(driver)
+                                price_coupon = combo_price.get("coupon_price")
+                                price_original = combo_price.get("original_price")
+                            except Exception as ex:
+                                print(f"    - Error clicking size {size_name}: {ex}")
+
                         # Avoid duplicates
                         if not any(s['name'] == size_name for s in sizes):
                             sizes.append({
                                 "name": size_name,
-                                "available": size_is_available
+                                "available": size_is_available,
+                                "price_coupon": price_coupon,
+                                "price_original": price_original
                             })
-                            print(f"    - Size {size_name}: {'有货' if size_is_available else '缺货'}")
+                            # record price candidates
+                            def _add_price_candidate(pstr, target_list):
+                                if pstr:
+                                    m = re.search(r"[\d.]+", pstr)
+                                    if m:
+                                        try:
+                                            target_list.append(float(m.group()))
+                                        except ValueError:
+                                            pass
+                            _add_price_candidate(price_coupon, price_candidates_coupon)
+                            _add_price_candidate(price_original, price_candidates_original)
+                            print(f"    - Size {size_name}: {'有货' if size_is_available else '缺货'} price: {price_coupon or price_original or 'N/A'}")
 
                     style_data["sizes"] = sizes
                     available_size_names = [s['name'] for s in sizes if s['available']]
@@ -857,6 +889,25 @@ def scrape_single_product(driver, product_url):
             except Exception as e:
                 print(f"  - Error getting sizes: {e}")
                 style_data["sizes"] = []
+
+            # If no sizes, record style-level price after selecting style
+            if not sizes:
+                try:
+                    combo_price = extract_price_info(driver)
+                    style_data["price_coupon"] = combo_price.get("coupon_price")
+                    style_data["price_original"] = combo_price.get("original_price")
+                    def _add_price_candidate(pstr, target_list):
+                        if pstr:
+                            m = re.search(r"[\d.]+", pstr)
+                            if m:
+                                try:
+                                    target_list.append(float(m.group()))
+                                except ValueError:
+                                    pass
+                    _add_price_candidate(style_data["price_coupon"], price_candidates_coupon)
+                    _add_price_candidate(style_data["price_original"], price_candidates_original)
+                except Exception as ex:
+                    print(f"  - Error getting style price: {ex}")
 
             # Remove the old available_sizes field if it exists
             if "available_sizes" in style_data:
@@ -988,6 +1039,19 @@ def scrape_single_product(driver, product_url):
                 })
     except Exception as e:
         print(f"Error extracting coupon info: {e}")
+
+    # Override price with min combo prices if available
+    def _min_price_str(values: List[float]) -> Optional[str]:
+        if not values:
+            return None
+        return f"¥{min(values):.2f}"
+
+    min_coupon = _min_price_str(price_candidates_coupon)
+    min_orig = _min_price_str(price_candidates_original)
+    if min_coupon:
+        price_info["coupon_price"] = min_coupon
+    if min_orig and "original_price" not in price_info:
+        price_info["original_price"] = min_orig
 
     # Aggregate OCR text from style main images
     main_image_ocr_texts = []
@@ -1442,7 +1506,9 @@ def _dict_to_product_data(data: Dict[str, Any]) -> ProductData:
             image_url=style_dict['image_url'],
             available=style_dict.get('available', True),
             sizes=sizes,
-            ocr=ocr_result
+            ocr=ocr_result,
+            price_coupon=style_dict.get("price_coupon"),
+            price_original=style_dict.get("price_original")
         )
         styles.append(style)
 
@@ -1787,7 +1853,15 @@ def _save_product_data_to_files(product_data: ProductData, original_dict: Dict[s
         for idx, style in enumerate(product_data.styles, 1):
             f.write(f"\nStyle {idx}: {style.style_name}\n")
             f.write(f"  Status: {'有货' if style.available else '缺货'}\n")
-            f.write(f"  Sizes: {', '.join([s.name for s in style.sizes])}\n")
+            if style.price_coupon or style.price_original:
+                f.write(f"  Style Price: {style.price_coupon or style.price_original or 'N/A'}\n")
+            size_lines = []
+            for s in style.sizes:
+                line = f"{s.name} ({'有货' if s.available else '缺货'})"
+                if s.price_coupon or s.price_original:
+                    line += f" | Price: {s.price_coupon or s.price_original}"
+                size_lines.append(line)
+            f.write(f"  Sizes: {', '.join(size_lines) if size_lines else 'N/A'}\n")
 
         # Reviews count
         f.write(f"\nTotal Reviews: {len(product_data.product_details.reviews)}\n")
